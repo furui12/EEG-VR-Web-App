@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>EEG VR Real-Time Pipeline</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+</head>
+<body>
+
+    <header>
+        <h1>EEG VR Analytics & Streaming</h1>
+        <div class="tab-container">
+            <button class="tab-btn active" onclick="switchTab('datastream', event)">Data Stream</button>
+            <button class="tab-btn" onclick="switchTab('subjects', event)">Subjects</button>
+            <button class="tab-btn" onclick="switchTab('setup', event)">Experimental Setup</button>
+            <button class="tab-btn" onclick="switchTab('export', event)">Export Data</button>
+        </div>
+    </header>
+
+    <main>
+        <!-- Data Stream Page -->
+        <section id="page-datastream" class="page active">
+            <div class="toolbar">
+                <div>
+                    <span id="current-trial-display" style="font-weight: 600; margin-right: 15px;">Trial: Loading...</span>
+                    <span id="current-subject-display" style="font-weight: 600;">Subject: Loading...</span>
+                </div>
+                <div>
+                    <button id="record-btn" class="btn" onclick="toggleRecording()">Start Recording</button>
+                </div>
+            </div>
+            <div class="datastream-content">
+                <div class="graph-container">
+                    <div id="plotly-div"></div>
+                </div>
+                <div class="sidebar">
+                    <h3>Pre-Processing Filters</h3>
+                    <div class="checkbox-group">
+                        <label class="checkbox-label"><input type="checkbox" id="chk-notch" value="notch"> Notch Filter</label>
+                        <label class="checkbox-label"><input type="checkbox" id="chk-bp" value="bp"> Bandpass Filter</label>
+                        <label class="checkbox-label"><input type="checkbox" id="chk-bl" value="bl"> Baseline Correction State</label>
+                        <label class="checkbox-label"><input type="checkbox" id="chk-asr" value="asr"> ASR-Inspired Motion Artifact Rejection State</label>
+                        <label class="checkbox-label"><input type="checkbox" id="chk-wvlt" value="wvlt"> Wavelet Transform Denoising</label>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Subjects Page -->
+        <section id="page-subjects" class="page" style="justify-content: center; align-items: center;">
+            <div class="card">
+                <h2>Add New Subject</h2>
+                <form id="subject-form" onsubmit="submitSubject(event)">
+                    <div class="form-group">
+                        <label for="subj-name">Subject Name</label>
+                        <input type="text" id="subj-name" class="form-control" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="subj-age">Age</label>
+                        <input type="number" id="subj-age" class="form-control">
+                    </div>
+                    <div class="form-group">
+                        <label for="subj-gender">Gender</label>
+                        <select id="subj-gender" class="form-control">
+                            <option value="">Select Gender</option>
+                            <option value="Male">Male</option>
+                            <option value="Female">Female</option>
+                            <option value="Other">Other</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="subj-notes">Notes</label>
+                        <textarea id="subj-notes" class="form-control" rows="3"></textarea>
+                    </div>
+                    <button type="submit" class="btn">Add Subject</button>
+                </form>
+            </div>
+        </section>
+
+        <!-- Experimental Setup Page -->
+        <section id="page-setup" class="page" style="justify-content: center; align-items: center;">
+            <div class="card" style="max-width: 900px;">
+                <h2>Experimental Setup</h2>
+                
+                <div class="form-row">
+                    <label>Subject Name</label>
+                    <select id="setup-subject" class="form-control" style="flex: 2;"></select>
+                    <label style="min-width: 100px; text-align: right;">Trial Number</label>
+                    <input type="number" id="setup-trial-num" class="form-control" style="flex: 1;" min="1">
+                </div>
+
+                <div class="form-row">
+                    <label>Hardware Info</label>
+                    <select id="setup-hw-name" class="form-control" style="flex: 1;"></select>
+                    <select id="setup-hw-value" class="form-control" style="flex: 2;"></select>
+                    <button type="button" class="btn" onclick="addCustomEntry('hw')">Add Entry</button>
+                </div>
+
+                <div class="form-row">
+                    <label>VR Event Stream Info</label>
+                    <select id="setup-vr-name" class="form-control" style="flex: 1;"></select>
+                    <select id="setup-vr-value" class="form-control" style="flex: 2;"></select>
+                    <button type="button" class="btn" onclick="addCustomEntry('vr')">Add Entry</button>
+                </div>
+
+                <div style="margin-top: 24px; text-align: right;">
+                    <button type="button" class="btn" onclick="saveConfiguration()">Save & Apply Configuration</button>
+                </div>
+            </div>
+        </section>
+
+        <!-- Export Data Page -->
+        <section id="page-export" class="page" style="justify-content: center; align-items: center;">
+            <div class="card" style="text-align: center;">
+                <h2>Export Recorded Data (.xdf)</h2>
+                <p style="margin-bottom: 24px; color: #666;">Export recorded LSL streams into a synchronized XDF file stored in the `data` directory.</p>
+                <div style="display: flex; justify-content: center; gap: 16px;">
+                    <button id="export-raw-btn" class="btn" onclick="exportData('raw')" disabled>Export EEG Data</button>
+                    <button id="export-all-btn" class="btn" onclick="exportData('all')" disabled>Export All Data</button>
+                </div>
+                <p id="export-status" style="margin-top: 20px; font-weight: 500; color: var(--primary-dark);"></p>
+            </div>
+        </section>
+    </main>
+
+    <!-- Unsaved Recording Modal -->
+    <div id="unsaved-modal" class="modal-overlay">
+        <div class="modal">
+            <h3>Unsaved Recording Detected</h3>
+            <p id="unsaved-modal-text">The previous recording was not saved. Do you want to initiate a new recording and abandon saving the previous data?</p>
+            <div class="modal-actions">
+                <button class="btn btn-danger" onclick="resolveUnsavedRecording(false)">Cancel</button>
+                <button class="btn" onclick="resolveUnsavedRecording(true)">OK</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>
