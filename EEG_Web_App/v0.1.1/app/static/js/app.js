@@ -2,6 +2,11 @@ let isRecording = false;
 let plotInitialized = false;
 let updateInterval = null;
 
+// Rolling buffer parameters for sliding window visualization
+let eegBuffer = []; 
+const WINDOW_SIZE = 500; // Number of samples visible in the sliding window
+let totalSampleCount = 0;
+
 function switchTab(tabId, event) {
     document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
     document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
@@ -19,12 +24,12 @@ function switchTab(tabId, event) {
 function initPlotly() {
     if (plotInitialized) return;
     const layout = {
-        title: 'Real-Time Raw EEG Channels',
-        margin: { t: 40, r: 20, b: 40, l: 50 },
+        grid: { rows: 1, columns: 1, pattern: 'independent' },
+        margin: { t: 30, r: 20, b: 30, l: 50 },
         paper_bgcolor: 'transparent',
         plot_bgcolor: 'transparent',
         xaxis: { title: 'Sample Index' },
-        yaxis: { title: 'Amplitude' }
+        yaxis: { title: 'Ch 1' }
     };
     Plotly.newPlot('plotly-div', [], layout, {responsive: true});
     plotInitialized = true;
@@ -61,9 +66,10 @@ function updateRecordButtonUI() {
         btn.innerText = "Stop Recording";
         btn.classList.add("btn-danger");
         if (!updateInterval) {
-            updateInterval = setInterval(fetchLiveData, 200);
+            updateInterval = setInterval(fetchLiveData, 100);
         }
     } else {
+        btn.innerText = "Stop Recording"; // fallback fix
         btn.innerText = "Start Recording";
         btn.classList.remove("btn-danger");
         if (updateInterval) {
@@ -81,6 +87,10 @@ async function toggleRecording() {
         if (document.getElementById('chk-bl').checked) filters.push('bl');
         if (document.getElementById('chk-asr').checked) filters.push('asr');
         if (document.getElementById('chk-wvlt').checked) filters.push('wvlt');
+
+        // Reset buffer on new recording start
+        eegBuffer = [];
+        totalSampleCount = 0;
 
         const res = await fetch('/api/recording/start', {
             method: 'POST',
@@ -127,26 +137,50 @@ async function fetchLiveData() {
         const res = await fetch('/api/data/live');
         const data = await res.json();
         if (data.chunk && data.chunk.length > 0) {
-            const chunk = data.chunk;
-            const n_ch = chunk[0].length;
+            const newRows = data.chunk;
+            const n_ch = newRows[0].length;
+
+            // Append incoming samples to rolling buffer
+            for (let i = 0; i < newRows.length; i++) {
+                eegBuffer.push(newRows[i]);
+                totalSampleCount++;
+            }
+
+            // Keep buffer size fixed to WINDOW_SIZE for sliding effect
+            if (eegBuffer.length > WINDOW_SIZE) {
+                eegBuffer = eegBuffer.slice(eegBuffer.length - WINDOW_SIZE);
+            }
+
             const traces = [];
             for (let ch = 0; ch < n_ch; ch++) {
-                const y = chunk.map(row => row[ch]);
-                const x = Array.from({length: y.length}, (_, i) => i);
+                const y = eegBuffer.map(row => row[ch]);
+                const startX = totalSampleCount - eegBuffer.length;
+                const x = Array.from({length: y.length}, (_, i) => startX + i);
+
                 traces.push({
                     y: y,
                     x: x,
                     type: 'scatter',
                     mode: 'lines',
-                    name: `Ch ${ch+1}`
+                    name: `Ch ${ch+1}`,
+                    xaxis: ch === 0 ? 'x' : `x${ch+1}`,
+                    yaxis: ch === 0 ? 'y' : `y${ch+1}`
                 });
             }
-            Plotly.react('plotly-div', traces, {
-                title: 'Real-Time Processed EEG Data',
-                margin: { t: 40, r: 20, b: 40, l: 50 },
+
+            // Dynamically scale plot height based on number of channels (e.g., 140px per channel graph)
+            const plotDiv = document.getElementById('plotly-div');
+            plotDiv.style.height = `${Math.max(400, n_ch * 140)}px`;
+
+            const layout = {
+                grid: { rows: n_ch, columns: 1, pattern: 'independent' },
+                margin: { t: 25, r: 20, b: 25, l: 50 },
                 paper_bgcolor: 'transparent',
-                plot_bgcolor: 'transparent'
-            });
+                plot_bgcolor: 'transparent',
+                showlegend: false
+            };
+
+            Plotly.react('plotly-div', traces, layout, {responsive: true});
         }
     } catch (err) {
         console.error("Error fetching live data", err);
