@@ -118,13 +118,18 @@ main {
     box-shadow: 0 1px 3px rgba(0,0,0,0.05);
     display: flex;
     flex-direction: column;
+    overflow-y: auto; /* Allows scrolling when multiple channel graphs are stacked */
 }
 
 #plotly-div {
+    width: 100%;
+}
+
+/* #plotly-div {
     flex: 1;
     width: 100%;
     height: 100%;
-}
+} */
 
 .sidebar {
     flex: 1;
