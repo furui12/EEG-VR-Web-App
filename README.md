@@ -70,3 +70,9 @@ starts it for the whole duration of each recording and writes
 ## Data & privacy
 `data/` contains the SQLite database (`app.db`) and the recordings, i.e. participant data.
 It is excluded from git via `.gitignore`.
+
+## Credits
+The work done on this project has been done by researchers and programmers at Mirai Innovation
+Research Institute, with the exception of the programs and files contained in LabRecorder-1.18.0-Win_amd64,
+which is the work of the contributors to the App-LabRecorder Github project. Their work and the latest
+versions of their project can be found at https://github.com/labstreaminglayer/App-LabRecorder.
