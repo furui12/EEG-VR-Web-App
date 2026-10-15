@@ -374,7 +374,8 @@ class LiveRecorderManager:
     def _start_labrecorder(self, out_file, hw_prop, hw_value, vr_prop, vr_value, has_vr):
         """If LABRECORDER_CLI_PATH is set, also record the streams with LabRecorderCLI
         for the whole duration of the trial (independent backup recording)."""
-        cli = os.environ.get("LABRECORDER_CLI_PATH", "")
+        cli = os.path.normpath(os.path.join(os.getcwd(), "..", "LabRecorder-1.18.0-Win_amd64", "LabRecorderCLI.exe"))
+
         self.labrecorder, self.labrecorder_file = None, None
         if not cli or not out_file:
             return
