@@ -5,7 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>EEG VR Real-Time Pipeline</title>
     <link rel="stylesheet" href="/static/css/style.css">
-    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+    <!-- Served locally so the app also works on lab machines without internet -->
+    <script src="/static/js/vendor/plotly-2.27.0.min.js"></script>
 </head>
 <body>
 
@@ -25,7 +26,8 @@
             <div class="toolbar">
                 <div>
                     <span id="current-trial-display" style="font-weight: 600; margin-right: 15px;">Trial: Loading...</span>
-                    <span id="current-subject-display" style="font-weight: 600;">Subject: Loading...</span>
+                    <span id="current-subject-display" style="font-weight: 600; margin-right: 15px;">Subject: Loading...</span>
+                    <span id="stream-status" class="status-line"></span>
                 </div>
                 <div>
                     <button id="record-btn" class="btn" onclick="toggleRecording()">Start Recording</button>
@@ -38,11 +40,12 @@
                 <div class="sidebar">
                     <h3>Pre-Processing Filters</h3>
                     <div class="checkbox-group">
-                        <label class="checkbox-label"><input type="checkbox" id="chk-notch" value="notch"> Notch Filter</label>
-                        <label class="checkbox-label"><input type="checkbox" id="chk-bp" value="bp"> Bandpass Filter</label>
-                        <label class="checkbox-label"><input type="checkbox" id="chk-bl" value="bl"> Baseline Correction State</label>
-                        <label class="checkbox-label"><input type="checkbox" id="chk-asr" value="asr"> ASR-Inspired Motion Artifact Rejection State</label>
-                        <label class="checkbox-label"><input type="checkbox" id="chk-wvlt" value="wvlt"> Wavelet Transform Denoising</label>
+                        <label class="checkbox-label"><input type="checkbox" id="chk-notch" value="notch"> Notch Filter (60 Hz)</label>
+                        <label class="checkbox-label"><input type="checkbox" id="chk-bp" value="bp"> Bandpass Filter (0.5&ndash;80 Hz)</label>
+                        <label class="checkbox-label"><input type="checkbox" id="chk-bl" value="bl"> Baseline Correction (running mean)</label>
+                        <label class="checkbox-label"><input type="checkbox" id="chk-asr" value="asr"> Robust Amplitude Clipping (ASR-inspired, not full ASR)</label>
+                        <label class="checkbox-label"><input type="checkbox" id="chk-wvlt" value="wvlt"> Wavelet Denoising (db4, sliding window)</label>
+                        <p class="hint">Filters are applied when a recording starts. Raw data is always stored; the filtered copy is published as an LSL stream (&lt;name&gt;_filtered) and included in &quot;Export All Data&quot;.</p>
                     </div>
                 </div>
             </div>
@@ -115,7 +118,7 @@
         <section id="page-export" class="page" style="justify-content: center; align-items: center;">
             <div class="card" style="text-align: center;">
                 <h2>Export Recorded Data (.xdf)</h2>
-                <p style="margin-bottom: 24px; color: #666;">Export recorded LSL streams into a synchronized XDF file stored in the `data` directory.</p>
+                <p style="margin-bottom: 24px; color: #666;">Export the current trial into an XDF file stored in the <code>data/</code> folder. &quot;EEG Data&quot; = raw EEG only; &quot;All Data&quot; = raw EEG + filtered EEG + VR markers.</p>
                 <div style="display: flex; justify-content: center; gap: 16px;">
                     <button id="export-raw-btn" class="btn" onclick="exportData('raw')" disabled>Export EEG Data</button>
                     <button id="export-all-btn" class="btn" onclick="exportData('all')" disabled>Export All Data</button>

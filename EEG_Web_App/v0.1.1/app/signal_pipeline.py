@@ -1,206 +1,412 @@
-import time
-import threading
-import subprocess
+"""LSL acquisition, real-time pre-processing and in-memory trial recording."""
 import os
+import subprocess
+import threading
+from collections import deque
+
 import numpy as np
-from pylsl import resolve_streams, resolve_byprop, StreamInlet, StreamOutlet, StreamInfo
-from scipy.signal import iirnotch, lfilter_zi, lfilter, butter, sosfilt, sosfilt_zi
+import pywt
+from pylsl import (
+    StreamInfo, StreamInlet, StreamOutlet, cf_float32, proc_clocksync,
+    resolve_byprop, resolve_streams,
+)
+from scipy.signal import butter, iirnotch, lfilter, lfilter_zi, sosfilt, sosfilt_zi
+
+RESOLVE_TIMEOUT = 2.0        # seconds to wait when looking up a stream
+LIVE_BUFFER_SECONDS = 10     # history kept for the live plot
+MAX_MARKERS_LIVE = 500
+
+CHANNEL_FORMATS = {
+    1: "float32", 2: "double64", 3: "string", 4: "int32",
+    5: "int16", 6: "int8", 7: "int64",
+}
+
+
+class StreamNotFoundError(RuntimeError):
+    pass
+
+
+def resolve_stream(prop, value, timeout=RESOLVE_TIMEOUT):
+    """Return the first StreamInfo matching prop=value, or None (never blocks forever)."""
+    if not prop or not value:
+        return None
+    try:
+        found = resolve_byprop(prop, value, 1, timeout)
+    except Exception:
+        found = []
+    return found[0] if found else None
+
+
+def channel_labels(info):
+    labels = []
+    try:
+        ch = info.desc().child("channels").child("channel")
+        while not ch.empty() and len(labels) < info.channel_count():
+            labels.append(ch.child_value("label") or f"Ch {len(labels) + 1}")
+            ch = ch.next_sibling()
+    except Exception:
+        labels = []
+    if len(labels) != info.channel_count():
+        labels = [f"Ch {i + 1}" for i in range(info.channel_count())]
+    return labels
+
 
 class StreamProcessor:
-    def __init__(self, eeg_name="AURA", stim_name="VR_Kitchen_Markers", notch_freq=60.0, locut=0.5, hicut=80.0, filts=[]):
-        self.filts = filts
-        self.qual_fctr = 30.0
-        self.filt_ord = 4
-        self._update_eeg_name(eeg_name)
-        self._update_params(notch_freq, locut, hicut)
+    """Causal, chunk-by-chunk pre-processing applied to the live EEG.
 
-    def _update_eeg_name(self, eeg_name):
-        self.eeg_name = eeg_name
-        self.eeg_streams = resolve_byprop('name', self.eeg_name)
-        if not self.eeg_streams:
-            self.eeg_streams = resolve_byprop('source_id', self.eeg_name)
-        if self.eeg_streams:
-            self._update_eeg_stream()
-        else:
-            self.eeg_inlet = None
-            self.eeg_chan_num = 8
-            self.eeg_srate = 250.0
-            self.eeg_label = eeg_name
+    Filters (applied in this order, each optional):
+      notch -- IIR notch at `notch_freq` (Q=30)
+      bp    -- 4th-order Butterworth band-pass [locut, hicut]
+      bl    -- running-mean baseline removal (EMA, alpha=0.01 per sample)
+      asr   -- robust amplitude clipping at median +/- 5 robust SD computed
+               over a sliding window. ASR-*inspired* only: it does not do the
+               calibration/PCA subspace reconstruction of real ASR.
+      wvlt  -- wavelet denoising (db4, universal soft threshold on detail
+               coefficients) over a sliding window; the newest samples are
+               returned, so the edge of the window adds some distortion.
+    Window-based steps keep their own history so the result does not depend on
+    how many samples LSL happens to deliver per chunk.
+    """
 
-    def _update_eeg_stream(self):
-        try:
-            self.eeg_inlet = StreamInlet(self.eeg_streams[0])
-            self.eeg_info = self.eeg_inlet.info()
-            self.eeg_label = self.eeg_info.name()
-            self.eeg_chan_num = self.eeg_info.channel_count()
-            eeg_srate = self.eeg_info.nominal_srate()
-            self.eeg_srate = eeg_srate if eeg_srate > 0 else 250.0
-        except Exception:
-            self.eeg_chan_num = 8
-            self.eeg_srate = 250.0
-            self.eeg_label = self.eeg_name
-
-    def _update_params(self, notch_freq, locut, hicut):
+    def __init__(self, srate, n_ch, filts=(), notch_freq=60.0, locut=0.5, hicut=80.0):
+        self.srate = float(srate) if srate and srate > 0 else 250.0
+        self.n_ch = n_ch
+        self.filts = set(filts or [])
         self.notch_freq = notch_freq
         self.locut = locut
-        self.hicut = hicut
+        self.hicut = min(hicut, 0.5 * self.srate - 1.0)
+        self.window = max(int(2 * self.srate), 64)        # 2 s statistics window
+        self.wvlt_window = 1 << int(np.ceil(np.log2(max(self.srate, 64))))  # ~1 s, power of 2
         self._init_filters()
 
     def _init_filters(self):
-        nyqst = 0.5 * self.eeg_srate
-        if "notch" in self.filts:
-            self.b_notch, self.a_notch = iirnotch(self.notch_freq, self.qual_fctr, fs=self.eeg_srate)
-            zi_notch = lfilter_zi(self.b_notch, self.a_notch)
-            self.notch_states = np.repeat(zi_notch[:, np.newaxis], self.eeg_chan_num, axis=1)
+        if "notch" in self.filts and self.notch_freq < 0.5 * self.srate:
+            self.b_notch, self.a_notch = iirnotch(self.notch_freq, 30.0, fs=self.srate)
+            zi = lfilter_zi(self.b_notch, self.a_notch)
+            self.notch_states = np.repeat(zi[:, np.newaxis], self.n_ch, axis=1)
+        else:
+            self.filts.discard("notch")
 
         if "bp" in self.filts:
-            if self.hicut >= nyqst:
-                self.hicut = nyqst - 1.0
-            self.bp_sos = butter(4, [self.locut, self.hicut], btype='band', fs=self.eeg_srate, output='sos')
-            zi_bp = sosfilt_zi(self.bp_sos)
-            self.bp_states = np.array([zi_bp.copy() for _ in range(self.eeg_chan_num)])
+            self.bp_sos = butter(4, [self.locut, self.hicut], btype="band", fs=self.srate, output="sos")
+            zi = sosfilt_zi(self.bp_sos)
+            self.bp_states = np.repeat(zi[:, :, np.newaxis], self.n_ch, axis=2)
 
         if "bl" in self.filts:
             self.baseline_alpha = 0.01
-            self.running_baseline = np.zeros(self.eeg_chan_num)
+            self.running_baseline = None
 
-    def process_chunk(self, chunk_np):
-        n_samples, n_ch = chunk_np.shape
-        processed = chunk_np.copy()
+        self.clip_hist = np.empty((0, self.n_ch))
+        self.wvlt_hist = np.empty((0, self.n_ch))
 
-        if "bp" in self.filts and hasattr(self, 'bp_sos'):
-            for ch in range(n_ch):
-                processed[:, ch], self.bp_states[ch] = sosfilt(
-                    self.bp_sos, processed[:, ch], zi=self.bp_states[ch]
-                )
+    def process_chunk(self, chunk):
+        x = np.asarray(chunk, dtype=np.float64).copy()
+        n = x.shape[0]
+        if n == 0:
+            return x
 
-        if "notch" in self.filts and hasattr(self, 'b_notch'):
-            for ch in range(n_ch):
-                processed[:, ch], self.notch_states[:, ch] = lfilter(
-                    self.b_notch, self.a_notch, processed[:, ch], zi=self.notch_states[:, ch]
-                )
+        if "notch" in self.filts:
+            x, self.notch_states = lfilter(self.b_notch, self.a_notch, x, axis=0, zi=self.notch_states)
 
-        if "bl" in self.filts and hasattr(self, 'running_baseline'):
-            for i in range(n_samples):
-                self.running_baseline = self.baseline_alpha * processed[i] + (1 - self.baseline_alpha) * self.running_baseline
-                processed[i] -= self.running_baseline
+        if "bp" in self.filts:
+            x, self.bp_states = sosfilt(self.bp_sos, x, axis=0, zi=self.bp_states)
+
+        if "bl" in self.filts:
+            if self.running_baseline is None:
+                self.running_baseline = x[0].copy()
+            a = self.baseline_alpha
+            for i in range(n):
+                self.running_baseline = a * x[i] + (1 - a) * self.running_baseline
+                x[i] -= self.running_baseline
 
         if "asr" in self.filts:
-            median_val = np.median(processed, axis=0)
-            mad = np.median(np.abs(processed - median_val), axis=0) + 1e-6
-            threshold = 5.0 * mad
-            processed = np.clip(processed, median_val - threshold, median_val + threshold)
+            self.clip_hist = np.vstack([self.clip_hist, x])[-self.window:]
+            if self.clip_hist.shape[0] >= self.srate / 2:
+                med = np.median(self.clip_hist, axis=0)
+                rsd = 1.4826 * np.median(np.abs(self.clip_hist - med), axis=0) + 1e-9
+                x = np.clip(x, med - 5 * rsd, med + 5 * rsd)
 
         if "wvlt" in self.filts:
-            sigma = np.median(np.abs(processed), axis=0) / 0.6745
-            thresholds = sigma * np.sqrt(2 * np.log(max(n_samples, 1)))
-            processed = np.sign(processed) * np.maximum(np.abs(processed) - thresholds, 0)
+            self.wvlt_hist = np.vstack([self.wvlt_hist, x])[-max(self.wvlt_window, n):]
+            seg = self.wvlt_hist
+            if seg.shape[0] >= 32:
+                wavelet = pywt.Wavelet("db4")
+                level = min(4, pywt.dwt_max_level(seg.shape[0], wavelet.dec_len))
+                if level >= 1:
+                    coeffs = pywt.wavedec(seg, wavelet, level=level, axis=0)
+                    sigma = np.median(np.abs(coeffs[-1]), axis=0) / 0.6745
+                    thr = sigma * np.sqrt(2 * np.log(seg.shape[0]))
+                    coeffs = [coeffs[0]] + [pywt.threshold(c, thr, mode="soft") for c in coeffs[1:]]
+                    rec = pywt.waverec(coeffs, wavelet, axis=0)[: seg.shape[0]]
+                    x = rec[-n:]
 
-        return processed
+        return x
+
 
 class LiveRecorderManager:
-    def __init__(self):
-        self.is_recording = False
-        self.thread = None
-        self.processor = None
-        self.outlet = None
-        self.latest_chunk = []
-        self.latest_timestamps = []
-        self._stop_event = threading.Event()
+    """Owns the LSL inlets/outlet and keeps the samples of the current trial in memory."""
 
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.is_recording = False
+        self.trial_id = None
+        self._stop_event = threading.Event()
+        self._threads = []
+        self.outlet = None
+        self.labrecorder = None
+        self.labrecorder_file = None
+        self.warnings = []
+        self._reset()
+
+    # ------------------------------------------------------------------ state
+    def _reset(self):
+        self.eeg_name = None
+        self.eeg_srate = 250.0
+        self.eeg_labels = []
+        self.eeg_format = "float32"
+        self.eeg_header_xml = None
+        self.filt_header_xml = None
+        self.marker_name = None
+        self.marker_format = "string"
+        self.marker_header_xml = None
+        self.raw_ts, self.raw_data, self.filt_data = [], [], []
+        self.marker_ts, self.marker_data = [], []
+        self.total_samples = 0
+        self.live = deque()          # (index, timestamp, [values])
+        self.live_markers = deque(maxlen=MAX_MARKERS_LIVE)  # (timestamp, label)
+
+    def has_data(self, trial_id):
+        return self.trial_id == trial_id and self.total_samples > 0
+
+    # -------------------------------------------------------------- discovery
     def discover_streams(self):
         try:
-            detected = resolve_streams(wait_time=1.0)
-            streams = []
-            for s in detected:
-                streams.append({
-                    "name": s.name(),
-                    "type": s.type(),
-                    "channels": s.channel_count(),
-                    "rate": s.nominal_srate(),
-                    "source_id": s.source_id()
-                })
-            return streams
+            return [{
+                "name": s.name(), "type": s.type(), "channels": s.channel_count(),
+                "rate": s.nominal_srate(), "source_id": s.source_id(),
+            } for s in resolve_streams(wait_time=1.0)]
         except Exception:
             return []
 
-    def start_recording(self, hardware_prop_name, hardware_prop_value, filters):
+    # -------------------------------------------------------------- recording
+    def start_recording(self, trial_id, hw_prop, hw_value, vr_prop, vr_value, filters,
+                        labrecorder_file=None):
         if self.is_recording:
-            return
+            raise RuntimeError("A recording is already running.")
+
+        eeg_info = resolve_stream(hw_prop, hw_value)
+        if eeg_info is None:
+            raise StreamNotFoundError(
+                f"No LSL stream found with {hw_prop}='{hw_value}'. Is the EEG device streaming?")
+
+        self._reset()
+        self.warnings = []
+        self.trial_id = trial_id
+
+        eeg_inlet = StreamInlet(eeg_info, max_buflen=360, processing_flags=proc_clocksync)
+        full = eeg_inlet.info(timeout=RESOLVE_TIMEOUT)
+        self.eeg_name = full.name()
+        self.eeg_srate = full.nominal_srate() or 250.0
+        self.eeg_labels = channel_labels(full)
+        self.eeg_format = CHANNEL_FORMATS.get(full.channel_format(), "float32")
+        if self.eeg_format == "string":
+            raise RuntimeError(f"Stream '{self.eeg_name}' has string samples; it is not an EEG stream.")
+        self.eeg_header_xml = full.as_xml()
+
+        out_info = StreamInfo(f"{self.eeg_name}_filtered", "EEG", full.channel_count(),
+                              full.nominal_srate(), cf_float32, f"{full.source_id()}_filtered")
+        chans = out_info.desc().append_child("channels")
+        for lab in self.eeg_labels:
+            chans.append_child("channel").append_child_value("label", lab)
+        out_info.desc().append_child_value("filters", ",".join(filters) or "none")
+        self.filt_header_xml = out_info.as_xml()
+        self.outlet = StreamOutlet(out_info)
+
+        marker_inlet = None
+        vr_info = resolve_stream(vr_prop, vr_value)
+        if vr_info is not None:
+            marker_inlet = StreamInlet(vr_info, max_buflen=360, processing_flags=proc_clocksync)
+            minfo = marker_inlet.info(timeout=RESOLVE_TIMEOUT)
+            self.marker_name = minfo.name()
+            self.marker_format = CHANNEL_FORMATS.get(minfo.channel_format(), "string")
+            self.marker_header_xml = minfo.as_xml()
+        else:
+            self.warnings.append(
+                f"VR marker stream {vr_prop}='{vr_value}' not found; recording EEG only.")
+
+        processor = StreamProcessor(self.eeg_srate, full.channel_count(), filters)
         self._stop_event.clear()
         self.is_recording = True
 
-        self.processor = StreamProcessor(eeg_name=hardware_prop_value, filts=filters)
-        
-        if self.processor.eeg_inlet:
+        self._start_labrecorder(labrecorder_file, hw_prop, hw_value, vr_prop, vr_value,
+                                marker_inlet is not None)
+
+        self._threads = [threading.Thread(target=self._eeg_loop, args=(eeg_inlet, processor), daemon=True)]
+        if marker_inlet is not None:
+            self._threads.append(threading.Thread(target=self._marker_loop, args=(marker_inlet,), daemon=True))
+        for t in self._threads:
+            t.start()
+
+        return {"eeg_stream": self.eeg_name, "marker_stream": self.marker_name,
+                "warnings": list(self.warnings)}
+
+    def _eeg_loop(self, inlet, processor):
+        max_live = int(LIVE_BUFFER_SECONDS * self.eeg_srate)
+        while not self._stop_event.is_set():
             try:
-                info = self.processor.eeg_inlet.info()
-                out_info = StreamInfo(
-                    name=f"{info.name()}_filtered",
-                    type='EEG',
-                    channel_count=info.channel_count(),
-                    nominal_srate=info.nominal_srate(),
-                    channel_format=info.channel_format(),
-                    source_id=f"{info.source_id()}_filtered"
-                )
-                self.outlet = StreamOutlet(out_info)
+                chunk, ts = inlet.pull_chunk(timeout=0.05, max_samples=512)
             except Exception:
-                self.outlet = None
+                continue
+            if not ts:
+                continue
+            raw = np.asarray(chunk, dtype=np.float64)
+            filt = processor.process_chunk(raw)
+            if self.outlet is not None:
+                try:
+                    self.outlet.push_chunk(filt.astype(np.float32).tolist(), ts)
+                except Exception:
+                    for i, t in enumerate(ts):
+                        self.outlet.push_sample(filt[i].tolist(), t)
+            with self.lock:
+                self.raw_ts.extend(ts)
+                self.raw_data.append(raw)
+                self.filt_data.append(filt)
+                for i, t in enumerate(ts):
+                    self.live.append((self.total_samples + i, t, filt[i].tolist()))
+                self.total_samples += len(ts)
+                while len(self.live) > max_live:
+                    self.live.popleft()
+        try:
+            inlet.close_stream()
+        except Exception:
+            pass
 
-        def run_loop():
-            while not self._stop_event.is_set():
-                if self.processor and self.processor.eeg_inlet:
-                    try:
-                        chunk, timestamps = self.processor.eeg_inlet.pull_chunk(timeout=0.01, max_samples=128)
-                        if timestamps:
-                            chunk_np = np.array(chunk)
-                            processed = self.processor.process_chunk(chunk_np)
-                            if self.outlet:
-                                for i in range(len(timestamps)):
-                                    self.outlet.push_sample(processed[i], timestamps[i])
-                            
-                            self.latest_chunk = processed.tolist()
-                            self.latest_timestamps = timestamps
-                    except Exception:
-                        pass
-                time.sleep(0.005)
-            self.is_recording = False
-
-        self.thread = threading.Thread(target=run_loop, daemon=True)
-        self.thread.start()
+    def _marker_loop(self, inlet):
+        while not self._stop_event.is_set():
+            try:
+                sample, ts = inlet.pull_sample(timeout=0.1)
+            except Exception:
+                continue
+            if ts is None:
+                continue
+            with self.lock:
+                self.marker_ts.append(ts)
+                self.marker_data.append(list(sample))
+                self.live_markers.append((ts, " | ".join(str(v) for v in sample)))
+        try:
+            inlet.close_stream()
+        except Exception:
+            pass
 
     def stop_recording(self):
         if not self.is_recording:
-            return
+            return {"samples": self.total_samples, "markers": len(self.marker_ts)}
         self._stop_event.set()
-        if self.thread:
-            self.thread.join(timeout=2.0)
+        for t in self._threads:
+            t.join(timeout=2.0)
+        self._threads = []
+        self._stop_labrecorder()
+        self.outlet = None   # destroys the *_filtered outlet
         self.is_recording = False
+        return {"samples": self.total_samples, "markers": len(self.marker_ts)}
 
-    def export_xdf(self, output_filename, export_type, hardware_prop_name, hardware_prop_value, vr_prop_name, vr_prop_value):
-        os.makedirs("data", exist_ok=True)
-        full_path = os.path.abspath(os.path.join("data", output_filename))
-        
-        lr_cli_path = os.environ.get("LABRECORDER_CLI_PATH", "")
-        
-        query_string = f"{hardware_prop_name}='{hardware_prop_value}'"
+    # ----------------------------------------------------------- live access
+    def get_live(self, since=0):
+        with self.lock:
+            entries = list(self.live)
+            markers = list(self.live_markers)
+        start_index = entries[0][0] if entries else self.total_samples
+        since = max(int(since), start_index)
+        new = [e for e in entries if e[0] >= since]
+
+        marker_out = []
+        if entries and markers:
+            ts_arr = np.fromiter((e[1] for e in entries), dtype=float, count=len(entries))
+            for mts, label in markers:
+                if mts < ts_arr[0]:
+                    continue
+                pos = int(np.searchsorted(ts_arr, mts))
+                if pos < len(entries):
+                    marker_out.append({"index": entries[pos][0], "time": mts, "label": label})
+
+        return {
+            "start_index": new[0][0] if new else since,
+            "next_index": (new[-1][0] + 1) if new else since,
+            "samples": [e[2] for e in new],
+            "markers": marker_out,
+            "srate": self.eeg_srate,
+            "channel_labels": self.eeg_labels,
+            "is_recording": self.is_recording,
+            "total_samples": self.total_samples,
+            "marker_count": len(self.marker_ts),
+            "warnings": list(self.warnings),
+        }
+
+    # ---------------------------------------------------------------- export
+    def export_xdf(self, trial_id, export_type, full_path):
+        from app.xdf_writer import write_xdf
+
+        if self.is_recording:
+            raise RuntimeError("Stop the recording before exporting.")
+        if not self.has_data(trial_id):
+            raise RuntimeError(
+                "No recorded data for this trial is in memory (was the server restarted?).")
+
+        with self.lock:
+            raw = np.vstack(self.raw_data)
+            filt = np.vstack(self.filt_data)
+            ts = list(self.raw_ts)
+            m_ts, m_data = list(self.marker_ts), list(self.marker_data)
+
+        streams = [{"header_xml": self.eeg_header_xml, "channel_format": self.eeg_format,
+                    "timestamps": ts, "samples": raw}]
         if export_type == "all":
-            query_string += f" {vr_prop_name}='{vr_prop_value}'"
-            query_string += f" name='{hardware_prop_value}_filtered'"
+            streams.append({"header_xml": self.filt_header_xml, "channel_format": "float32",
+                            "timestamps": ts, "samples": filt})
+            if self.marker_header_xml is not None:
+                streams.append({"header_xml": self.marker_header_xml,
+                                "channel_format": self.marker_format,
+                                "timestamps": m_ts, "samples": m_data})
+        write_xdf(full_path, streams)
+        return {"streams": len(streams), "samples": len(ts), "markers": len(m_ts)}
 
-        if lr_cli_path and os.path.exists(lr_cli_path):
+    # ----------------------------------------------------- optional LabRecorder
+    def _start_labrecorder(self, out_file, hw_prop, hw_value, vr_prop, vr_value, has_vr):
+        """If LABRECORDER_CLI_PATH is set, also record the streams with LabRecorderCLI
+        for the whole duration of the trial (independent backup recording)."""
+        cli = os.environ.get("LABRECORDER_CLI_PATH", "")
+        self.labrecorder, self.labrecorder_file = None, None
+        if not cli or not out_file:
+            return
+        if not os.path.exists(cli):
+            self.warnings.append(f"LABRECORDER_CLI_PATH does not exist: {cli}")
+            return
+        queries = [f"{hw_prop}='{hw_value}'", f"name='{self.eeg_name}_filtered'"]
+        if has_vr:
+            queries.append(f"{vr_prop}='{vr_value}'")
+        try:
+            self.labrecorder = subprocess.Popen(
+                [cli, out_file, *queries], stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True)
+            self.labrecorder_file = out_file
+        except Exception as exc:
+            self.warnings.append(f"Could not start LabRecorderCLI: {exc}")
+
+    def _stop_labrecorder(self):
+        proc = self.labrecorder
+        if proc is None:
+            return
+        try:
+            proc.stdin.write("\n")   # LabRecorderCLI stops on Enter
+            proc.stdin.flush()
+            proc.wait(timeout=10)
+        except Exception:
+            proc.terminate()
             try:
-                proc = subprocess.Popen([lr_cli_path, full_path, query_string], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                time.sleep(2)
-                proc.terminate()
-                proc.wait()
+                proc.wait(timeout=5)
             except Exception:
-                with open(full_path, "w") as f:
-                    f.write(f"XDF Export Simulation: {export_type}\nQuery: {query_string}\nTimestamp: {time.time()}")
-        else:
-            with open(full_path, "w") as f:
-                f.write(f"XDF Mock Export ({export_type})\nStreams: {query_string}\nCreated at {time.time()}")
+                proc.kill()
+        self.labrecorder = None
 
-        return full_path
 
 manager = LiveRecorderManager()
