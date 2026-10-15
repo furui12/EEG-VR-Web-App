@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store
+# Local database and recordings (contain participant data)
+EEG_Web_App/*/data/
