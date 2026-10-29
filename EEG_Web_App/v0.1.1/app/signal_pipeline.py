@@ -1,8 +1,10 @@
-"""LSL acquisition, real-time pre-processing and in-memory trial recording."""
+"""LSL acquisition, real-time pre-processing, live analysis and trial recording."""
 import os
 import subprocess
 import threading
+import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pywt
@@ -10,10 +12,19 @@ from pylsl import (
     StreamInfo, StreamInlet, StreamOutlet, cf_float32, proc_clocksync,
     resolve_byprop, resolve_streams,
 )
+from pylsl import cf_string, local_clock
 from scipy.signal import butter, iirnotch, lfilter, lfilter_zi, sosfilt, sosfilt_zi
 
+from app.analysis import channel_quality, live_metrics
+from app.aura_decoder import StreamDecoder
+from app.trial_store import TrialWriter, export_trial, sample_count
+
 RESOLVE_TIMEOUT = 2.0        # seconds to wait when looking up a stream
+CHECK_TIMEOUT = 1.0          # quicker lookup used for the status indicators
 LIVE_BUFFER_SECONDS = 10     # history kept for the live plot
+RAW_HISTORY_SECONDS = 4      # raw window used for signal quality and live metrics
+QUALITY_EVERY = 0.5          # seconds
+METRICS_EVERY = 1.0          # seconds
 MAX_MARKERS_LIVE = 500
 
 CHANNEL_FORMATS = {
@@ -73,8 +84,9 @@ class StreamProcessor:
         self.n_ch = n_ch
         self.filts = set(filts or [])
         self.notch_freq = notch_freq
-        self.locut = locut
-        self.hicut = min(hicut, 0.5 * self.srate - 1.0)
+        nyq = 0.5 * self.srate
+        self.hicut = float(min(max(hicut, 1.0), nyq - 1.0))
+        self.locut = float(min(max(locut, 0.01), self.hicut - 0.5))
         self.window = max(int(2 * self.srate), 64)        # 2 s statistics window
         self.wvlt_window = 1 << int(np.ceil(np.log2(max(self.srate, 64))))  # ~1 s, power of 2
         self._init_filters()
@@ -82,15 +94,15 @@ class StreamProcessor:
     def _init_filters(self):
         if "notch" in self.filts and self.notch_freq < 0.5 * self.srate:
             self.b_notch, self.a_notch = iirnotch(self.notch_freq, 30.0, fs=self.srate)
-            zi = lfilter_zi(self.b_notch, self.a_notch)
-            self.notch_states = np.repeat(zi[:, np.newaxis], self.n_ch, axis=1)
+            self.notch_zi = lfilter_zi(self.b_notch, self.a_notch)
+            self.notch_states = None
         else:
             self.filts.discard("notch")
 
         if "bp" in self.filts:
             self.bp_sos = butter(4, [self.locut, self.hicut], btype="band", fs=self.srate, output="sos")
-            zi = sosfilt_zi(self.bp_sos)
-            self.bp_states = np.repeat(zi[:, :, np.newaxis], self.n_ch, axis=2)
+            self.bp_zi = sosfilt_zi(self.bp_sos)
+            self.bp_states = None
 
         if "bl" in self.filts:
             self.baseline_alpha = 0.01
@@ -106,9 +118,13 @@ class StreamProcessor:
             return x
 
         if "notch" in self.filts:
+            if self.notch_states is None:   # start in steady state for the first sample
+                self.notch_states = self.notch_zi[:, np.newaxis] * x[0][np.newaxis, :]
             x, self.notch_states = lfilter(self.b_notch, self.a_notch, x, axis=0, zi=self.notch_states)
 
         if "bp" in self.filts:
+            if self.bp_states is None:
+                self.bp_states = self.bp_zi[:, :, np.newaxis] * x[0][np.newaxis, np.newaxis, :]
             x, self.bp_states = sosfilt(self.bp_sos, x, axis=0, zi=self.bp_states)
 
         if "bl" in self.filts:
@@ -143,84 +159,189 @@ class StreamProcessor:
         return x
 
 
+def describe_filters(filters, params):
+    """Human-readable summary stored with each trial, e.g. 'notch 60 Hz, band-pass 0.5-40 Hz'."""
+    parts = []
+    f = set(filters or [])
+    if "notch" in f:
+        parts.append(f"notch {params.get('notch_freq', 60):g} Hz")
+    if "bp" in f:
+        parts.append(f"band-pass {params.get('locut', 0.5):g}-{params.get('hicut', 40):g} Hz")
+    if "bl" in f:
+        parts.append("baseline correction")
+    if "asr" in f:
+        parts.append("robust clipping (ASR-inspired)")
+    if "wvlt" in f:
+        parts.append("wavelet denoising")
+    return ", ".join(parts) or "none"
+
+
+def stream_summary(info):
+    return {
+        "name": info.name(), "type": info.type(), "channels": info.channel_count(),
+        "rate": info.nominal_srate(), "source_id": info.source_id(),
+    }
+
+
+def _labelled_header(name, stype, labels, srate, fmt, source_id, extra=None):
+    info = StreamInfo(name, stype, len(labels), srate, fmt, source_id)
+    chans = info.desc().append_child("channels")
+    for lab in labels:
+        chans.append_child("channel").append_child_value("label", lab)
+    for k, v in (extra or {}).items():
+        info.desc().append_child_value(k, str(v))
+    return info
+
+
+METRIC_NAMES = ["theta_alpha_frontal", "theta_alpha_parietal",
+                "theta_frontal", "alpha_frontal", "theta_parietal", "alpha_parietal"]
+
+
 class LiveRecorderManager:
-    """Owns the LSL inlets/outlet and keeps the samples of the current trial in memory."""
+    """Owns the LSL connection, the live analysis and the recording of the current trial.
+
+    Life cycle:
+      connect()          -> streams are read and shown live (preview, nothing stored)
+      set_filters()      -> change pre-processing while previewing
+      set_montage()      -> channel names and the channels used for the live metrics
+      begin_recording()  -> samples/markers/notes/metrics are written to disk as they arrive
+      end_recording()    -> stop writing; the stream stays connected for the next trial
+      export_xdf()       -> write the stored trial to an XDF file
+      disconnect()
+    """
 
     def __init__(self):
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
+        self.connected = False
         self.is_recording = False
+        self.config = None
         self.trial_id = None
-        self._stop_event = threading.Event()
-        self._threads = []
+        self.trial_folder = None
+        self.writer = None
+        self.processor = None
+        self.decoder = None
+        self.filters = []
+        self.filter_params = {}
         self.outlet = None
+        self.metrics_outlet = None
+        self.notes_outlet = None
         self.labrecorder = None
         self.labrecorder_file = None
         self.warnings = []
-        self._reset()
+        self.record_started = None
+        self.record_duration = 0.0
+        self.auto_stop_at = None
+        self.record_counts = {"samples": 0, "markers": 0, "notes": 0}
+        self.frontal = 0
+        self.parietal = 1
+        self._stop_event = threading.Event()
+        self._threads = []
+        self._reset_stream_info()
+        self._reset_live()
 
     # ------------------------------------------------------------------ state
-    def _reset(self):
+    def _reset_stream_info(self):
         self.eeg_name = None
+        self.eeg_source_id = ""
+        self.eeg_channels = 0
         self.eeg_srate = 250.0
         self.eeg_labels = []
+        self.device_labels = []
         self.eeg_format = "float32"
-        self.eeg_header_xml = None
-        self.filt_header_xml = None
+        self._eeg_info = None
         self.marker_name = None
         self.marker_format = "string"
         self.marker_header_xml = None
-        self.raw_ts, self.raw_data, self.filt_data = [], [], []
-        self.marker_ts, self.marker_data = [], []
-        self.total_samples = 0
+
+    def _reset_live(self):
         self.live = deque()          # (index, timestamp, [values])
-        self.live_markers = deque(maxlen=MAX_MARKERS_LIVE)  # (timestamp, label)
+        self.live_markers = deque(maxlen=MAX_MARKERS_LIVE)  # (timestamp, label, kind)
+        self.total_samples = 0
+        self.last_sample_wall = None
+        self.raw_hist = np.empty((0, max(self.eeg_channels, 1)))
+        self.quality = []
+        self.metrics = None
+        self.metrics_history = deque(maxlen=600)   # (elapsed or wall time, ta_frontal, ta_parietal)
+        self._last_quality = 0.0
+        self._last_metrics = 0.0
 
     def has_data(self, trial_id):
-        return self.trial_id == trial_id and self.total_samples > 0
+        return (self.trial_id == trial_id and self.trial_folder is not None
+                and sample_count(self.trial_folder) > 0)
+
+    def elapsed(self):
+        if self.is_recording and self.record_started:
+            return time.time() - self.record_started
+        return self.record_duration
+
+    @property
+    def line_freq(self):
+        return float(self.filter_params.get("notch_freq", 60.0)) if self.filter_params else 60.0
 
     # -------------------------------------------------------------- discovery
     def discover_streams(self):
         try:
-            return [{
-                "name": s.name(), "type": s.type(), "channels": s.channel_count(),
-                "rate": s.nominal_srate(), "source_id": s.source_id(),
-            } for s in resolve_streams(wait_time=1.0)]
+            return [stream_summary(s) for s in resolve_streams(wait_time=1.0)]
         except Exception:
             return []
 
-    # -------------------------------------------------------------- recording
-    def start_recording(self, trial_id, hw_prop, hw_value, vr_prop, vr_value, filters,
-                        labrecorder_file=None):
-        if self.is_recording:
-            raise RuntimeError("A recording is already running.")
+    def check_streams(self, hw_prop, hw_value, vr_prop, vr_value):
+        """Look up the EEG and VR streams in parallel (used by the status indicators)."""
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            eeg_f = pool.submit(resolve_stream, hw_prop, hw_value, CHECK_TIMEOUT)
+            vr_f = pool.submit(resolve_stream, vr_prop, vr_value, CHECK_TIMEOUT)
+            eeg, vr = eeg_f.result(), vr_f.result()
+        return {
+            "eeg": {"found": eeg is not None, **(stream_summary(eeg) if eeg else {})},
+            "vr": {"found": vr is not None, **(stream_summary(vr) if vr else {})},
+        }
 
+    # ------------------------------------------------------------- connection
+    def connect(self, config, filters, params, montage=None, force=False):
+        """Open the EEG (required) and VR marker (optional) streams and start the live preview."""
+        if self.is_recording:
+            raise RuntimeError("Stop the recording first.")
+        if self.connected and self.config == config and not force:
+            self.set_filters(filters, params)
+            return self.connection_info()
+        self.disconnect()
+
+        hw_prop, hw_value = config["hardware_prop_name"], config["hardware_prop_value"]
+        vr_prop, vr_value = config["vr_prop_name"], config["vr_prop_value"]
         eeg_info = resolve_stream(hw_prop, hw_value)
         if eeg_info is None:
             raise StreamNotFoundError(
                 f"No LSL stream found with {hw_prop}='{hw_value}'. Is the EEG device streaming?")
 
-        self._reset()
+        self._reset_stream_info()
         self.warnings = []
-        self.trial_id = trial_id
 
         eeg_inlet = StreamInlet(eeg_info, max_buflen=360, processing_flags=proc_clocksync)
         full = eeg_inlet.info(timeout=RESOLVE_TIMEOUT)
-        self.eeg_name = full.name()
-        self.eeg_srate = full.nominal_srate() or 250.0
-        self.eeg_labels = channel_labels(full)
         self.eeg_format = CHANNEL_FORMATS.get(full.channel_format(), "float32")
         if self.eeg_format == "string":
-            raise RuntimeError(f"Stream '{self.eeg_name}' has string samples; it is not an EEG stream.")
-        self.eeg_header_xml = full.as_xml()
+            raise RuntimeError(f"Stream '{full.name()}' has text samples; it is not an EEG stream.")
+        self._eeg_info = full
+        self.eeg_name = full.name()
+        self.eeg_source_id = full.source_id()
+        self.eeg_channels = full.channel_count()
+        self.eeg_srate = full.nominal_srate() or 250.0
+        self.device_labels = channel_labels(full)
+        self.eeg_labels = list(self.device_labels)
+        self.decoder = StreamDecoder(self.eeg_channels, self.eeg_srate)
+        self._reset_live()
+        if montage:
+            self.set_montage(montage.get("labels"), montage.get("frontal"), montage.get("parietal"))
+        else:
+            self.set_montage(None, None, None)
 
-        out_info = StreamInfo(f"{self.eeg_name}_filtered", "EEG", full.channel_count(),
-                              full.nominal_srate(), cf_float32, f"{full.source_id()}_filtered")
-        chans = out_info.desc().append_child("channels")
-        for lab in self.eeg_labels:
-            chans.append_child("channel").append_child_value("label", lab)
-        out_info.desc().append_child_value("filters", ",".join(filters) or "none")
-        self.filt_header_xml = out_info.as_xml()
+        out_info = _labelled_header(f"{self.eeg_name}_filtered", "EEG", self.eeg_labels,
+                                    self.eeg_srate, cf_float32, f"{self.eeg_source_id}_filtered")
         self.outlet = StreamOutlet(out_info)
+        self.metrics_outlet = StreamOutlet(_labelled_header(
+            "VREEG_Metrics", "Metrics", METRIC_NAMES, 1.0 / METRICS_EVERY, cf_float32, "vreeg_metrics"))
+        self.notes_outlet = StreamOutlet(StreamInfo(
+            "VREEG_Annotations", "Markers", 1, 0, cf_string, "vreeg_annotations"))
 
         marker_inlet = None
         vr_info = resolve_stream(vr_prop, vr_value)
@@ -231,55 +352,251 @@ class LiveRecorderManager:
             self.marker_format = CHANNEL_FORMATS.get(minfo.channel_format(), "string")
             self.marker_header_xml = minfo.as_xml()
         else:
-            self.warnings.append(
-                f"VR marker stream {vr_prop}='{vr_value}' not found; recording EEG only.")
+            self.warnings.append(f"VR marker stream {vr_prop}='{vr_value}' not found; only EEG will be recorded.")
 
-        processor = StreamProcessor(self.eeg_srate, full.channel_count(), filters)
+        self.config = dict(config)
+        self.set_filters(filters, params)
         self._stop_event.clear()
-        self.is_recording = True
+        self.connected = True
 
-        self._start_labrecorder(labrecorder_file, hw_prop, hw_value, vr_prop, vr_value,
-                                marker_inlet is not None)
-
-        self._threads = [threading.Thread(target=self._eeg_loop, args=(eeg_inlet, processor), daemon=True)]
+        self._threads = [threading.Thread(target=self._eeg_loop, args=(eeg_inlet,), daemon=True)]
         if marker_inlet is not None:
             self._threads.append(threading.Thread(target=self._marker_loop, args=(marker_inlet,), daemon=True))
         for t in self._threads:
             t.start()
+        return self.connection_info()
 
-        return {"eeg_stream": self.eeg_name, "marker_stream": self.marker_name,
-                "warnings": list(self.warnings)}
+    def connection_info(self):
+        return {
+            "connected": self.connected,
+            "eeg_stream": self.eeg_name,
+            "channels": self.eeg_channels,
+            "srate": self.eeg_srate,
+            "channel_labels": self.eeg_labels,
+            "device_labels": self.device_labels,
+            "frontal": self.frontal,
+            "parietal": self.parietal,
+            "marker_stream": self.marker_name,
+            "decoding": self.decoder.description if self.decoder else None,
+            "warnings": list(self.warnings),
+            "config": self.config,
+        }
 
-    def _eeg_loop(self, inlet, processor):
+    def set_filters(self, filters, params):
+        if self.is_recording:
+            raise RuntimeError("Filters cannot be changed while recording.")
+        params = dict(params or {})
+        with self.lock:
+            self.filters = [f for f in (filters or []) if f in ("notch", "bp", "bl", "asr", "wvlt")]
+            self.processor = StreamProcessor(
+                self.eeg_srate, max(self.eeg_channels, 1), self.filters,
+                notch_freq=float(params.get("notch_freq", 60.0)),
+                locut=float(params.get("locut", 0.5)),
+                hicut=float(params.get("hicut", 40.0)))
+            self.filter_params = {
+                "notch_freq": self.processor.notch_freq,
+                "locut": self.processor.locut,
+                "hicut": self.processor.hicut,
+            }
+        return {"filters": self.filters, "filter_params": self.filter_params}
+
+    def set_montage(self, labels, frontal, parietal):
+        """Channel names and which channels feed the theta/alpha metrics."""
+        if self.is_recording:
+            raise RuntimeError("Channel names cannot be changed while recording.")
+        C = self.eeg_channels
+        if labels and len(labels) == C:
+            self.eeg_labels = [str(l).strip() or f"Ch {i + 1}" for i, l in enumerate(labels)]
+        upper = [l.upper() for l in self.eeg_labels]
+
+        def pick(value, preferred, fallback):
+            if value is not None and 0 <= int(value) < C:
+                return int(value)
+            for name in preferred:
+                if name in upper:
+                    return upper.index(name)
+            return min(fallback, C - 1) if C else 0
+
+        self.frontal = pick(frontal, ["FZ", "F3", "F4", "FPZ"], 0)
+        self.parietal = pick(parietal, ["PZ", "P3", "P4", "CPZ"], 1)
+        return {"labels": self.eeg_labels, "frontal": self.frontal, "parietal": self.parietal}
+
+    def disconnect(self):
+        if self.is_recording:
+            self.end_recording()
+        if not self.connected and not self._threads:
+            return
+        self._stop_event.set()
+        for t in self._threads:
+            t.join(timeout=2.0)
+        self._threads = []
+        self.outlet = None   # destroys the outlets
+        self.metrics_outlet = None
+        self.notes_outlet = None
+        self.connected = False
+
+    # ------------------------------------------------------------- headers
+    def _headers(self):
+        extra = {}
+        if self.decoder and self.decoder.description:
+            extra["decoding"] = self.decoder.description
+        eeg = _labelled_header(self.eeg_name, self._eeg_info.type() or "EEG", self.eeg_labels,
+                               self.eeg_srate, self._eeg_info.channel_format(),
+                               self.eeg_source_id, extra)
+        filt = _labelled_header(f"{self.eeg_name}_filtered", "EEG", self.eeg_labels, self.eeg_srate,
+                                cf_float32, f"{self.eeg_source_id}_filtered",
+                                {"filters": describe_filters(self.filters, self.filter_params)})
+        notes = StreamInfo("Experimenter_Annotations", "Markers", 1, 0, cf_string, "vreeg_annotations")
+        metrics = _labelled_header("VREEG_Metrics", "Metrics", METRIC_NAMES, 1.0 / METRICS_EVERY,
+                                   cf_float32, "vreeg_metrics",
+                                   {"frontal_channel": self.eeg_labels[self.frontal],
+                                    "parietal_channel": self.eeg_labels[self.parietal],
+                                    "window_s": RAW_HISTORY_SECONDS,
+                                    "note": "theta 4-8 Hz, alpha 8-13 Hz, Welch PSD on raw data"})
+        return {
+            "eeg_header": eeg.as_xml(), "eeg_format": self.eeg_format,
+            "filt_header": filt.as_xml(),
+            "marker_header": self.marker_header_xml, "marker_format": self.marker_format,
+            "notes_header": notes.as_xml(),
+            "metrics_header": metrics.as_xml(), "metric_names": METRIC_NAMES,
+            "channels": self.eeg_channels,
+        }
+
+    # -------------------------------------------------------------- recording
+    def begin_recording(self, trial_id, folder, labrecorder_file=None):
+        if not self.connected:
+            raise RuntimeError("Connect the streams first.")
+        if self.is_recording:
+            raise RuntimeError("A recording is already running.")
+        if self.decoder and self.decoder.mode == "detect":
+            raise RuntimeError("Still analysing the EEG stream, try again in a second.")
+        meta = {"trial_id": trial_id, "started": time.time(), **self._headers()}
+        with self.lock:
+            self.writer = TrialWriter(folder, meta)
+            self.trial_folder = folder
+            self.trial_id = trial_id
+            self.record_counts = {"samples": 0, "markers": 0, "notes": 0}
+            self.record_started = time.time()
+            self.record_duration = 0.0
+            self.metrics_history.clear()
+            self.is_recording = True
+        self._start_labrecorder(labrecorder_file)
+
+    def end_recording(self):
+        if not self.is_recording:
+            return self.record_summary()
+        with self.lock:
+            self.is_recording = False
+            self.record_duration = time.time() - self.record_started
+            if self.writer:
+                self.writer.close()
+                self.writer = None
+        self._stop_labrecorder()
+        return self.record_summary()
+
+    def record_summary(self):
+        return {
+            "samples": self.record_counts["samples"],
+            "markers": self.record_counts["markers"],
+            "notes": self.record_counts["notes"],
+            "duration_s": round(self.elapsed(), 2),
+        }
+
+    def add_note(self, label):
+        """Experimenter annotation (button / keyboard). Saved when recording, always shown live."""
+        label = str(label).strip()[:200]
+        if not label:
+            raise ValueError("Empty annotation.")
+        ts = local_clock()
+        with self.lock:
+            self.live_markers.append((ts, label, "note"))
+            if self.is_recording and self.writer:
+                self.writer.write_event("notes", ts, [label])
+                self.record_counts["notes"] += 1
+        if self.notes_outlet is not None:
+            try:
+                self.notes_outlet.push_sample([label], ts)
+            except Exception:
+                pass
+        return {"time": ts, "label": label, "saved": self.is_recording,
+                "elapsed": round(self.elapsed(), 1)}
+
+    def _eeg_loop(self, inlet):
         max_live = int(LIVE_BUFFER_SECONDS * self.eeg_srate)
+        max_hist = int(RAW_HISTORY_SECONDS * self.eeg_srate)
+        last_flush = time.time()
         while not self._stop_event.is_set():
             try:
-                chunk, ts = inlet.pull_chunk(timeout=0.05, max_samples=512)
+                chunk, ts = inlet.pull_chunk(timeout=0.05, max_samples=1024)
             except Exception:
                 continue
             if not ts:
                 continue
-            raw = np.asarray(chunk, dtype=np.float64)
+            raw, ts = self.decoder.feed(np.asarray(chunk, dtype=np.float64), ts)
+            if len(ts) == 0:
+                continue
+            raw = np.asarray(raw, dtype=np.float64)
+            with self.lock:
+                processor = self.processor
             filt = processor.process_chunk(raw)
             if self.outlet is not None:
                 try:
-                    self.outlet.push_chunk(filt.astype(np.float32).tolist(), ts)
+                    self.outlet.push_chunk(filt.astype(np.float32).tolist(), list(ts))
                 except Exception:
-                    for i, t in enumerate(ts):
-                        self.outlet.push_sample(filt[i].tolist(), t)
+                    pass
+            now = time.time()
             with self.lock:
-                self.raw_ts.extend(ts)
-                self.raw_data.append(raw)
-                self.filt_data.append(filt)
+                if self.is_recording and self.writer:
+                    self.writer.write_eeg(ts, raw, filt)
+                    self.record_counts["samples"] += len(ts)
+                    if now - last_flush > 1.0:
+                        self.writer.flush()
+                        last_flush = now
                 for i, t in enumerate(ts):
                     self.live.append((self.total_samples + i, t, filt[i].tolist()))
                 self.total_samples += len(ts)
+                self.last_sample_wall = now
                 while len(self.live) > max_live:
                     self.live.popleft()
+                if self.raw_hist.shape[1] != raw.shape[1]:
+                    self.raw_hist = np.empty((0, raw.shape[1]))
+                self.raw_hist = np.vstack([self.raw_hist, raw])[-max_hist:]
+                hist = self.raw_hist
+            self._analyse(hist, ts[-1], now)
         try:
             inlet.close_stream()
         except Exception:
             pass
+
+    def _analyse(self, hist, last_ts, now):
+        if now - self._last_quality >= QUALITY_EVERY:
+            self._last_quality = now
+            n2 = int(2 * self.eeg_srate)
+            try:
+                self.quality = channel_quality(hist[-n2:], self.eeg_srate, self.line_freq)
+            except Exception:
+                self.quality = []
+        if now - self._last_metrics >= METRICS_EVERY:
+            self._last_metrics = now
+            try:
+                m = live_metrics(hist, self.eeg_srate, self.frontal, self.parietal)
+            except Exception:
+                m = None
+            self.metrics = m
+            if m and "frontal" in m and "parietal" in m:
+                row = [m["frontal"]["theta_alpha"], m["parietal"]["theta_alpha"],
+                       m["frontal"]["theta"], m["frontal"]["alpha"],
+                       m["parietal"]["theta"], m["parietal"]["alpha"]]
+                t_axis = self.elapsed() if self.is_recording else None
+                with self.lock:
+                    self.metrics_history.append((t_axis, row[0], row[1]))
+                    if self.is_recording and self.writer:
+                        self.writer.write_metrics(last_ts, row)
+                if self.metrics_outlet is not None:
+                    try:
+                        self.metrics_outlet.push_sample([float(v) for v in row], last_ts)
+                    except Exception:
+                        pass
 
     def _marker_loop(self, inlet):
         while not self._stop_event.is_set():
@@ -290,31 +607,22 @@ class LiveRecorderManager:
             if ts is None:
                 continue
             with self.lock:
-                self.marker_ts.append(ts)
-                self.marker_data.append(list(sample))
-                self.live_markers.append((ts, " | ".join(str(v) for v in sample)))
+                if self.is_recording and self.writer:
+                    self.writer.write_event("markers", ts, sample)
+                    self.record_counts["markers"] += 1
+                self.live_markers.append((ts, " | ".join(str(v) for v in sample), "vr"))
         try:
             inlet.close_stream()
         except Exception:
             pass
-
-    def stop_recording(self):
-        if not self.is_recording:
-            return {"samples": self.total_samples, "markers": len(self.marker_ts)}
-        self._stop_event.set()
-        for t in self._threads:
-            t.join(timeout=2.0)
-        self._threads = []
-        self._stop_labrecorder()
-        self.outlet = None   # destroys the *_filtered outlet
-        self.is_recording = False
-        return {"samples": self.total_samples, "markers": len(self.marker_ts)}
 
     # ----------------------------------------------------------- live access
     def get_live(self, since=0):
         with self.lock:
             entries = list(self.live)
             markers = list(self.live_markers)
+            last_wall = self.last_sample_wall
+            history = [h for h in self.metrics_history if h[0] is not None] if self.is_recording else []
         start_index = entries[0][0] if entries else self.total_samples
         since = max(int(since), start_index)
         new = [e for e in entries if e[0] >= since]
@@ -322,12 +630,12 @@ class LiveRecorderManager:
         marker_out = []
         if entries and markers:
             ts_arr = np.fromiter((e[1] for e in entries), dtype=float, count=len(entries))
-            for mts, label in markers:
+            for mts, label, kind in markers:
                 if mts < ts_arr[0]:
                     continue
                 pos = int(np.searchsorted(ts_arr, mts))
                 if pos < len(entries):
-                    marker_out.append({"index": entries[pos][0], "time": mts, "label": label})
+                    marker_out.append({"index": entries[pos][0], "time": mts, "label": label, "kind": kind})
 
         return {
             "start_index": new[0][0] if new else since,
@@ -336,54 +644,55 @@ class LiveRecorderManager:
             "markers": marker_out,
             "srate": self.eeg_srate,
             "channel_labels": self.eeg_labels,
+            "connected": self.connected,
+            "receiving": bool(last_wall and time.time() - last_wall < 2.0),
+            "analysing": bool(self.decoder and self.decoder.mode == "detect"),
+            "decoding": self.decoder.description if self.decoder else None,
             "is_recording": self.is_recording,
-            "total_samples": self.total_samples,
-            "marker_count": len(self.marker_ts),
+            "elapsed": round(self.elapsed(), 1),
+            "remaining": self._remaining(),
+            "trial_id": self.trial_id,
+            "record_samples": self.record_counts["samples"],
+            "record_markers": self.record_counts["markers"],
+            "record_notes": self.record_counts["notes"],
+            "quality": self.quality,
+            "metrics": self.metrics,
+            "metrics_history": history[-300:],
+            "frontal": self.frontal,
+            "parietal": self.parietal,
             "warnings": list(self.warnings),
         }
 
+    def _remaining(self):
+        at = self.auto_stop_at
+        if not (self.is_recording and at):
+            return None
+        return round(max(0.0, at - time.time()), 1)
+
     # ---------------------------------------------------------------- export
     def export_xdf(self, trial_id, export_type, full_path):
-        from app.xdf_writer import write_xdf
-
-        if self.is_recording:
+        if self.is_recording and self.trial_id == trial_id:
             raise RuntimeError("Stop the recording before exporting.")
         if not self.has_data(trial_id):
-            raise RuntimeError(
-                "No recorded data for this trial is in memory (was the server restarted?).")
-
-        with self.lock:
-            raw = np.vstack(self.raw_data)
-            filt = np.vstack(self.filt_data)
-            ts = list(self.raw_ts)
-            m_ts, m_data = list(self.marker_ts), list(self.marker_data)
-
-        streams = [{"header_xml": self.eeg_header_xml, "channel_format": self.eeg_format,
-                    "timestamps": ts, "samples": raw}]
-        if export_type == "all":
-            streams.append({"header_xml": self.filt_header_xml, "channel_format": "float32",
-                            "timestamps": ts, "samples": filt})
-            if self.marker_header_xml is not None:
-                streams.append({"header_xml": self.marker_header_xml,
-                                "channel_format": self.marker_format,
-                                "timestamps": m_ts, "samples": m_data})
-        write_xdf(full_path, streams)
-        return {"streams": len(streams), "samples": len(ts), "markers": len(m_ts)}
+            raise RuntimeError("The data of this trial is no longer available.")
+        return export_trial(self.trial_folder, export_type, full_path)
 
     # ----------------------------------------------------- optional LabRecorder
-    def _start_labrecorder(self, out_file, hw_prop, hw_value, vr_prop, vr_value, has_vr):
+    def _start_labrecorder(self, out_file):
         """If LABRECORDER_CLI_PATH is set, also record the streams with LabRecorderCLI
-        for the whole duration of the trial (independent backup recording)."""
+        for the duration of the trial (independent backup recording)."""
         cli = os.environ.get("LABRECORDER_CLI_PATH", "")
         self.labrecorder, self.labrecorder_file = None, None
-        if not cli or not out_file:
+        if not cli or not out_file or not self.config:
             return
         if not os.path.exists(cli):
             self.warnings.append(f"LABRECORDER_CLI_PATH does not exist: {cli}")
             return
-        queries = [f"{hw_prop}='{hw_value}'", f"name='{self.eeg_name}_filtered'"]
-        if has_vr:
-            queries.append(f"{vr_prop}='{vr_value}'")
+        c = self.config
+        queries = [f"{c['hardware_prop_name']}='{c['hardware_prop_value']}'",
+                   f"name='{self.eeg_name}_filtered'", "name='VREEG_Annotations'", "name='VREEG_Metrics'"]
+        if self.marker_name:
+            queries.append(f"{c['vr_prop_name']}='{c['vr_prop_value']}'")
         try:
             self.labrecorder = subprocess.Popen(
                 [cli, out_file, *queries], stdin=subprocess.PIPE,

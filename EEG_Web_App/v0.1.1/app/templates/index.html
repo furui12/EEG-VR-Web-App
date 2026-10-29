@@ -3,143 +3,512 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>EEG VR Real-Time Pipeline</title>
+    <title>VR EEG Studio · Researcher</title>
     <link rel="stylesheet" href="/static/css/style.css">
     <!-- Served locally so the app also works on lab machines without internet -->
     <script src="/static/js/vendor/plotly-2.27.0.min.js"></script>
 </head>
 <body>
 
-    <header>
-        <h1>EEG VR Analytics & Streaming</h1>
-        <div class="tab-container">
-            <button class="tab-btn active" onclick="switchTab('datastream', event)">Data Stream</button>
-            <button class="tab-btn" onclick="switchTab('subjects', event)">Subjects</button>
-            <button class="tab-btn" onclick="switchTab('setup', event)">Experimental Setup</button>
-            <button class="tab-btn" onclick="switchTab('export', event)">Export Data</button>
+<header class="topbar">
+    <div class="brand" id="brand" role="button" tabindex="0">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span>VR EEG Studio</span>
+        <span class="mode-tag" data-i18n="op.researcher">Researcher</span>
+    </div>
+    <nav class="mainnav" aria-label="Main">
+        <button class="nav-btn active" data-view="home" data-i18n="nav.home">Home</button>
+        <button class="nav-btn" data-view="session" data-i18n="nav.session">Session</button>
+        <button class="nav-btn" data-view="participants" data-i18n="nav.participants">Participants</button>
+        <button class="nav-btn" data-view="history" data-i18n="nav.history">History</button>
+    </nav>
+    <div class="topbar-right">
+        <span class="pill" id="pill-eeg" title=""><span class="dot"></span><span>EEG</span></span>
+        <span class="pill" id="pill-vr" title=""><span class="dot"></span><span>VR</span></span>
+        <span class="pill pill-rec" id="pill-rec" hidden><span class="dot"></span><span data-i18n="rec.recording">Recording</span> <span id="pill-rec-time">00:00</span></span>
+        <a class="operator-link" href="/" data-i18n="op.back_operator">Operator mode</a>
+        <button class="icon-btn" id="help-btn" data-i18n-title="help.open" title="How it works">?</button>
+        <select id="lang-select" class="lang-select" aria-label="Language">
+            <option value="en">English</option>
+            <option value="es">Español</option>
+            <option value="ja">日本語</option>
+        </select>
+    </div>
+</header>
+
+<main>
+    <!-- =============================== HOME =============================== -->
+    <section id="view-home" class="view active">
+        <div class="home-hero card">
+            <div class="hero-main">
+                <h1 data-i18n="home.title">VR EEG Studio</h1>
+                <p class="lead" data-i18n="home.lead">Record EEG synchronized with the events of VR neuroadaptive games, check signal quality and cognitive-load metrics live, and keep every trial organized.</p>
+                <div class="hero-actions">
+                    <button class="btn rec-cta" id="home-back-rec" hidden><span class="rec-icon"></span><span data-i18n="home.back_rec">Recording in progress — open it</span></button>
+                    <button class="btn primary big" id="home-new" data-i18n="home.new">+ New session</button>
+                    <button class="btn big" id="home-continue" hidden></button>
+                </div>
+            </div>
+            <div class="hero-status">
+                <h3 data-i18n="home.status">Lab status</h3>
+                <div class="status-row"><span class="status-dot" id="home-eeg-dot"></span><div><strong>EEG</strong><div class="hint" id="home-eeg-text">—</div></div></div>
+                <div class="status-row"><span class="status-dot" id="home-vr-dot"></span><div><strong>VR</strong><div class="hint" id="home-vr-text">—</div></div></div>
+                <button class="btn ghost small" id="home-streams" data-i18n="home.check_streams">Stream settings</button>
+            </div>
         </div>
-    </header>
-
-    <main>
-        <!-- Data Stream Page -->
-        <section id="page-datastream" class="page active">
-            <div class="toolbar">
-                <div>
-                    <span id="current-trial-display" style="font-weight: 600; margin-right: 15px;">Trial: Loading...</span>
-                    <span id="current-subject-display" style="font-weight: 600; margin-right: 15px;">Subject: Loading...</span>
-                    <span id="stream-status" class="status-line"></span>
-                </div>
-                <div>
-                    <button id="record-btn" class="btn" onclick="toggleRecording()">Start Recording</button>
-                </div>
+        <div id="home-recovered" class="banner warning" hidden></div>
+        <div class="stat-grid">
+            <div class="card stat-card"><span class="stat-big" id="home-n-part">0</span><span class="stat-label" data-i18n="nav.participants">Participants</span></div>
+            <div class="card stat-card"><span class="stat-big" id="home-n-trials">0</span><span class="stat-label" data-i18n="home.trials_total">Trials recorded</span></div>
+            <div class="card stat-card"><span class="stat-big" id="home-n-today">0</span><span class="stat-label" data-i18n="home.trials_today">Trials today</span></div>
+        </div>
+        <div class="home-cols">
+            <div class="card table-card">
+                <div class="card-head"><h3 data-i18n="home.recent">Recent trials</h3><button class="btn link" id="home-history" data-i18n="home.see_all">See all →</button></div>
+                <table class="table">
+                    <tbody id="home-recent"></tbody>
+                </table>
+                <div id="home-recent-empty" class="empty-state" hidden data-i18n="hist.empty">No trials recorded yet.</div>
             </div>
-            <div class="datastream-content">
-                <div class="graph-container">
-                    <div id="plotly-div"></div>
-                </div>
-                <div class="sidebar">
-                    <h3>Pre-Processing Filters</h3>
-                    <div class="checkbox-group">
-                        <label class="checkbox-label"><input type="checkbox" id="chk-notch" value="notch"> Notch Filter (60 Hz)</label>
-                        <label class="checkbox-label"><input type="checkbox" id="chk-bp" value="bp"> Bandpass Filter (0.5&ndash;80 Hz)</label>
-                        <label class="checkbox-label"><input type="checkbox" id="chk-bl" value="bl"> Baseline Correction (running mean)</label>
-                        <label class="checkbox-label"><input type="checkbox" id="chk-asr" value="asr"> Robust Amplitude Clipping (ASR-inspired, not full ASR)</label>
-                        <label class="checkbox-label"><input type="checkbox" id="chk-wvlt" value="wvlt"> Wavelet Denoising (db4, sliding window)</label>
-                        <p class="hint">Filters are applied when a recording starts. Raw data is always stored; the filtered copy is published as an LSL stream (&lt;name&gt;_filtered) and included in &quot;Export All Data&quot;.</p>
-                    </div>
-                </div>
-            </div>
-        </section>
-
-        <!-- Subjects Page -->
-        <section id="page-subjects" class="page" style="justify-content: center; align-items: center;">
             <div class="card">
-                <h2>Add New Subject</h2>
-                <form id="subject-form" onsubmit="submitSubject(event)">
-                    <div class="form-group">
-                        <label for="subj-name">Subject Name</label>
-                        <input type="text" id="subj-name" class="form-control" required>
+                <h3 data-i18n="help.title">How a session works</h3>
+                <ol class="mini-steps">
+                    <li><span class="step-num">1</span><span data-i18n="help.s1">pick or register who is taking part.</span></li>
+                    <li><span class="step-num">2</span><span data-i18n="help.s2">start the AURA software and the VR game; wait until EEG (and VR) turn green.</span></li>
+                    <li><span class="step-num">3</span><span data-i18n="help.s3">look at the live signal, choose filters, then press Start.</span></li>
+                    <li><span class="step-num">4</span><span data-i18n="help.s4">the trial is saved automatically as an .xdf file.</span></li>
+                </ol>
+                <p class="hint"><span data-i18n="step4.folder">Folder:</span> <code id="home-folder"></code></p>
+            </div>
+        </div>
+    </section>
+
+    <!-- =============================== SESSION (wizard) =============================== -->
+    <section id="view-session" class="view">
+        <ol class="stepper" id="stepper">
+            <li data-step="1"><span class="step-num">1</span><span class="step-label" data-i18n="step1.title">Participant</span></li>
+            <li data-step="2"><span class="step-num">2</span><span class="step-label" data-i18n="step2.title">Connect streams</span></li>
+            <li data-step="3"><span class="step-num">3</span><span class="step-label" data-i18n="step3.title">Signal &amp; record</span></li>
+            <li data-step="4"><span class="step-num">4</span><span class="step-label" data-i18n="step4.title">Saved</span></li>
+        </ol>
+
+        <!-- Step 1: participant -->
+        <div class="step-panel card" id="step-1">
+            <h2 data-i18n="step1.heading">Who is taking part in this session?</h2>
+            <p class="lead" data-i18n="step1.lead">Choose a registered participant or register a new one. Each recording is saved under this participant.</p>
+
+            <div class="field">
+                <label for="s1-subject" data-i18n="step1.select">Participant</label>
+                <select id="s1-subject" class="input"></select>
+            </div>
+            <div id="s1-subject-info" class="info-line"></div>
+
+            <details id="s1-new" class="inline-form">
+                <summary data-i18n="step1.new">+ Register a new participant</summary>
+                <form id="s1-new-form" class="form-grid" autocomplete="off">
+                    <div class="field span-2">
+                        <label for="s1-name"><span data-i18n="subj.name">Name or code</span> *</label>
+                        <input id="s1-name" class="input" required data-i18n-placeholder="subj.name_ph" placeholder="e.g. P001">
                     </div>
-                    <div class="form-group">
-                        <label for="subj-age">Age</label>
-                        <input type="number" id="subj-age" class="form-control">
+                    <div class="field">
+                        <label for="s1-age" data-i18n="subj.age">Age</label>
+                        <input id="s1-age" class="input" type="number" min="0" max="130">
                     </div>
-                    <div class="form-group">
-                        <label for="subj-gender">Gender</label>
-                        <select id="subj-gender" class="form-control">
-                            <option value="">Select Gender</option>
-                            <option value="Male">Male</option>
-                            <option value="Female">Female</option>
-                            <option value="Other">Other</option>
+                    <div class="field">
+                        <label for="s1-gender" data-i18n="subj.gender">Gender</label>
+                        <select id="s1-gender" class="input">
+                            <option value="" data-i18n="subj.gender_none">—</option>
+                            <option value="Male" data-i18n="subj.male">Male</option>
+                            <option value="Female" data-i18n="subj.female">Female</option>
+                            <option value="Other" data-i18n="subj.other">Other</option>
                         </select>
                     </div>
-                    <div class="form-group">
-                        <label for="subj-notes">Notes</label>
-                        <textarea id="subj-notes" class="form-control" rows="3"></textarea>
+                    <div class="field span-2">
+                        <label for="s1-notes" data-i18n="subj.notes">Notes</label>
+                        <textarea id="s1-notes" class="input" rows="2"></textarea>
                     </div>
-                    <button type="submit" class="btn">Add Subject</button>
+                    <div class="span-2"><button type="submit" class="btn" data-i18n="subj.save_new">Save participant</button></div>
                 </form>
-            </div>
-        </section>
+            </details>
 
-        <!-- Experimental Setup Page -->
-        <section id="page-setup" class="page" style="justify-content: center; align-items: center;">
-            <div class="card" style="max-width: 900px;">
-                <h2>Experimental Setup</h2>
-                
-                <div class="form-row">
-                    <label>Subject Name</label>
-                    <select id="setup-subject" class="form-control" style="flex: 2;"></select>
-                    <label style="min-width: 100px; text-align: right;">Trial Number</label>
-                    <input type="number" id="setup-trial-num" class="form-control" style="flex: 1;" min="1">
-                </div>
-
-                <div class="form-row">
-                    <label>Hardware Info</label>
-                    <select id="setup-hw-name" class="form-control" style="flex: 1;"></select>
-                    <select id="setup-hw-value" class="form-control" style="flex: 2;"></select>
-                    <button type="button" class="btn" onclick="addCustomEntry('hw')">Add Entry</button>
-                </div>
-
-                <div class="form-row">
-                    <label>VR Event Stream Info</label>
-                    <select id="setup-vr-name" class="form-control" style="flex: 1;"></select>
-                    <select id="setup-vr-value" class="form-control" style="flex: 2;"></select>
-                    <button type="button" class="btn" onclick="addCustomEntry('vr')">Add Entry</button>
-                </div>
-
-                <div style="margin-top: 24px; text-align: right;">
-                    <button type="button" class="btn" onclick="saveConfiguration()">Save & Apply Configuration</button>
-                </div>
-            </div>
-        </section>
-
-        <!-- Export Data Page -->
-        <section id="page-export" class="page" style="justify-content: center; align-items: center;">
-            <div class="card" style="text-align: center;">
-                <h2>Export Recorded Data (.xdf)</h2>
-                <p style="margin-bottom: 24px; color: #666;">Export the current trial into an XDF file stored in the <code>data/</code> folder. &quot;EEG Data&quot; = raw EEG only; &quot;All Data&quot; = raw EEG + filtered EEG + VR markers.</p>
-                <div style="display: flex; justify-content: center; gap: 16px;">
-                    <button id="export-raw-btn" class="btn" onclick="exportData('raw')" disabled>Export EEG Data</button>
-                    <button id="export-all-btn" class="btn" onclick="exportData('all')" disabled>Export All Data</button>
-                </div>
-                <p id="export-status" style="margin-top: 20px; font-weight: 500; color: var(--primary-dark);"></p>
-            </div>
-        </section>
-    </main>
-
-    <!-- Unsaved Recording Modal -->
-    <div id="unsaved-modal" class="modal-overlay">
-        <div class="modal">
-            <h3>Unsaved Recording Detected</h3>
-            <p id="unsaved-modal-text">The previous recording was not saved. Do you want to initiate a new recording and abandon saving the previous data?</p>
-            <div class="modal-actions">
-                <button class="btn btn-danger" onclick="resolveUnsavedRecording(false)">Cancel</button>
-                <button class="btn" onclick="resolveUnsavedRecording(true)">OK</button>
+            <div class="actions">
+                <span></span>
+                <button class="btn primary" id="s1-next" data-i18n="step1.next">Next: connect streams →</button>
             </div>
         </div>
-    </div>
 
-    <script src="/static/js/app.js"></script>
+        <!-- Step 2: streams -->
+        <div class="step-panel card" id="step-2" hidden>
+            <h2 data-i18n="step2.heading">Connect the EEG and the VR game</h2>
+            <p class="lead" data-i18n="step2.lead">Start the AURA software and the VR game so they publish their LSL streams. The indicators turn green when each stream is found.</p>
+
+            <div class="stream-grid">
+                <div class="stream-card" id="card-eeg">
+                    <div class="stream-card-head">
+                        <span class="status-dot" id="s2-eeg-dot"></span>
+                        <h3 data-i18n="step2.eeg">EEG device</h3>
+                        <span class="tag required" data-i18n="common.required">required</span>
+                    </div>
+                    <div class="stream-fields">
+                        <select id="s2-hw-prop" class="input small">
+                            <option value="name">name</option>
+                            <option value="source_id">source_id</option>
+                            <option value="type">type</option>
+                        </select>
+                        <input id="s2-hw-value" class="input" list="hw-values">
+                        <datalist id="hw-values"></datalist>
+                    </div>
+                    <p class="stream-detail" id="s2-eeg-detail"></p>
+                </div>
+                <div class="stream-card" id="card-vr">
+                    <div class="stream-card-head">
+                        <span class="status-dot" id="s2-vr-dot"></span>
+                        <h3 data-i18n="step2.vr">VR event markers</h3>
+                        <span class="tag" data-i18n="common.optional">optional</span>
+                    </div>
+                    <div class="stream-fields">
+                        <select id="s2-vr-prop" class="input small">
+                            <option value="name">name</option>
+                            <option value="source_id">source_id</option>
+                            <option value="type">type</option>
+                        </select>
+                        <input id="s2-vr-value" class="input" list="vr-values">
+                        <datalist id="vr-values"></datalist>
+                    </div>
+                    <p class="stream-detail" id="s2-vr-detail"></p>
+                </div>
+            </div>
+
+            <div class="discover">
+                <div class="discover-head">
+                    <h3 data-i18n="step2.found_title">Streams found on the network</h3>
+                    <button class="btn ghost" id="s2-scan" data-i18n="step2.scan">↻ Scan again</button>
+                </div>
+                <p class="hint" data-i18n="step2.found_hint">Click a stream to use it. Signal streams go to EEG, marker streams to VR.</p>
+                <div id="s2-discovered" class="discover-list"></div>
+            </div>
+
+            <div class="actions">
+                <button class="btn ghost" data-goto="1" data-i18n="common.back">← Back</button>
+                <button class="btn primary" id="s2-next" data-i18n="step2.next">Next: check signal →</button>
+            </div>
+        </div>
+
+        <!-- Step 3: preview + record -->
+        <div class="step-panel" id="step-3" hidden>
+            <div class="session-bar card">
+                <div class="session-facts">
+                    <div><span class="fact-label" data-i18n="step1.select">Participant</span><strong id="s3-subject">—</strong></div>
+                    <div>
+                        <span class="fact-label" data-i18n="rec.trial">Trial</span>
+                        <input id="s3-trial" class="input trial-input" type="number" min="1">
+                    </div>
+                    <div><span class="fact-label">EEG</span><strong id="s3-eeg">—</strong></div>
+                    <div><span class="fact-label">VR</span><strong id="s3-vr">—</strong></div>
+                </div>
+                <button class="btn ghost" id="s3-change" data-i18n="rec.change">Change setup</button>
+            </div>
+            <div id="s3-decoding" class="banner info" hidden></div>
+            <div id="s3-trial-warning" class="banner warning" hidden></div>
+            <div id="s3-banner" class="banner" hidden></div>
+
+            <div class="record-layout">
+                <div class="main-col">
+                <div class="card plot-card">
+                    <div class="plot-head">
+                        <span class="mode-badge" id="s3-mode" data-i18n="rec.preview">Preview — not recording</span>
+                        <span class="hint" data-i18n="rec.window">Last 4 seconds · dotted lines = VR events</span>
+                    </div>
+                    <div class="quality-bar">
+                        <span class="quality-title" data-i18n="quality.title">Signal quality</span>
+                        <div class="quality-strip" id="s3-quality"></div>
+                        <button class="btn link small" id="s3-montage" data-i18n="montage.edit">Channel names</button>
+                    </div>
+                    <div id="plotly-div"></div>
+                    <div id="s3-noplot" class="empty-state" data-i18n="rec.waiting">Waiting for EEG data…</div>
+                </div>
+
+                <div class="card metrics-card">
+                    <div class="card-head">
+                        <h3><span data-i18n="metrics.title">Cognitive load index</span> <span class="muted">θ/α</span></h3>
+                        <span class="info" data-i18n-title="metrics.info" title="">i</span>
+                    </div>
+                    <div class="metrics-grid">
+                        <div class="metric-box">
+                            <div class="metric-head"><span data-i18n="metrics.frontal">Frontal</span> <select id="m-frontal" class="input tiny"></select></div>
+                            <div class="metric-val" id="m-frontal-val">—</div>
+                            <div class="band-bars" id="m-frontal-bands"></div>
+                        </div>
+                        <div class="metric-box">
+                            <div class="metric-head"><span data-i18n="metrics.parietal">Parietal</span> <select id="m-parietal" class="input tiny"></select></div>
+                            <div class="metric-val" id="m-parietal-val">—</div>
+                            <div class="band-bars" id="m-parietal-bands"></div>
+                        </div>
+                        <div class="metric-trend">
+                            <div class="hint" data-i18n="metrics.trend">Trend during the recording</div>
+                            <div id="metrics-plot"></div>
+                        </div>
+                    </div>
+                </div>
+                </div>
+
+                <aside class="side">
+                    <div class="card record-card">
+                        <button class="btn record-btn" id="record-btn">
+                            <span class="rec-icon"></span><span id="record-btn-label" data-i18n="rec.start">Start recording</span>
+                        </button>
+                        <div class="rec-stats">
+                            <div><span class="stat-val" id="s3-time">00:00</span><span class="stat-label" data-i18n="rec.time">time</span></div>
+                            <div><span class="stat-val" id="s3-samples">0</span><span class="stat-label" data-i18n="rec.samples">samples</span></div>
+                            <div><span class="stat-val" id="s3-markers">0</span><span class="stat-label" data-i18n="rec.markers">events</span></div>
+                        </div>
+                        <p class="hint" id="s3-rec-hint" data-i18n="rec.hint_idle">Check that the signal looks clean, then press Start. The trial is saved automatically when you stop.</p>
+                    </div>
+
+                    <div class="card notes-card">
+                        <h3 data-i18n="notes.title">Annotations</h3>
+                        <p class="hint" data-i18n="notes.hint">Mark what happens during the trial. Saved with the recording. Shortcut: N</p>
+                        <div class="note-buttons">
+                            <button class="btn small" data-note="movement" data-i18n="notes.movement">Movement</button>
+                            <button class="btn small" data-note="blink" data-i18n="notes.blink">Blinks</button>
+                            <button class="btn small" data-note="talking" data-i18n="notes.talking">Talking</button>
+                            <button class="btn small" data-note="discomfort" data-i18n="notes.discomfort">Discomfort</button>
+                        </div>
+                        <form id="note-form" class="note-form" autocomplete="off">
+                            <input id="note-input" class="input" maxlength="200" data-i18n-placeholder="notes.placeholder" placeholder="Write a note and press Enter">
+                        </form>
+                    </div>
+
+                    <div class="card filters-card">
+                        <h3 data-i18n="filters.title">Real-time filters</h3>
+                        <p class="hint" data-i18n="filters.hint">Changes apply instantly to the preview. They are locked while recording. Raw data is always saved too.</p>
+
+                        <div class="filter-row">
+                            <label class="filter-check"><input type="checkbox" id="f-notch"> <span class="filter-name" data-i18n="filters.notch">Notch (power-line noise)</span></label>
+                            <select id="f-notch-freq" class="input tiny"><option value="60">60 Hz</option><option value="50">50 Hz</option></select>
+                            <span class="info" data-i18n-title="filters.notch_info" title="">i</span>
+                        </div>
+                        <div class="filter-row">
+                            <label class="filter-check"><input type="checkbox" id="f-bp"> <span class="filter-name" data-i18n="filters.bp">Band-pass</span></label>
+                            <span class="range">
+                                <input id="f-lo" class="input tiny" type="number" step="0.1" min="0.1" value="0.5">–<input id="f-hi" class="input tiny" type="number" step="1" min="2" value="40"> Hz
+                            </span>
+                            <span class="info" data-i18n-title="filters.bp_info" title="">i</span>
+                        </div>
+                        <div class="filter-row">
+                            <label class="filter-check"><input type="checkbox" id="f-bl"> <span class="filter-name" data-i18n="filters.bl">Baseline correction</span></label>
+                            <span class="info" data-i18n-title="filters.bl_info" title="">i</span>
+                        </div>
+                        <div class="filter-row">
+                            <label class="filter-check"><input type="checkbox" id="f-asr"> <span class="filter-name" data-i18n="filters.asr">Artifact clipping (ASR-inspired)</span></label>
+                            <span class="info" data-i18n-title="filters.asr_info" title="">i</span>
+                        </div>
+                        <div class="filter-row">
+                            <label class="filter-check"><input type="checkbox" id="f-wvlt"> <span class="filter-name" data-i18n="filters.wvlt">Wavelet denoising</span></label>
+                            <span class="info" data-i18n-title="filters.wvlt_info" title="">i</span>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <h3 data-i18n="rec.events">VR events</h3>
+                        <ul id="s3-event-log" class="event-log"><li class="muted" data-i18n="rec.no_events">No events yet</li></ul>
+                    </div>
+                </aside>
+            </div>
+        </div>
+
+        <!-- Step 4: result -->
+        <div class="step-panel card" id="step-4" hidden>
+            <div id="s4-ok">
+                <div class="result-head ok"><span class="result-icon">✓</span><h2 data-i18n="step4.saved">Trial saved</h2></div>
+                <dl class="result-grid">
+                    <div><dt data-i18n="step1.select">Participant</dt><dd id="s4-subject"></dd></div>
+                    <div><dt data-i18n="rec.trial">Trial</dt><dd id="s4-trial"></dd></div>
+                    <div><dt data-i18n="step4.duration">Duration</dt><dd id="s4-duration"></dd></div>
+                    <div><dt data-i18n="rec.samples">samples</dt><dd id="s4-samples"></dd></div>
+                    <div><dt data-i18n="rec.markers">events</dt><dd id="s4-markers"></dd></div>
+                    <div><dt data-i18n="notes.title">Annotations</dt><dd id="s4-notes-count"></dd></div>
+                    <div><dt data-i18n="filters.title">Real-time filters</dt><dd id="s4-filters"></dd></div>
+                </dl>
+                <div class="file-box">
+                    <div>
+                        <div class="file-name" id="s4-file"></div>
+                        <div class="hint"><span data-i18n="step4.folder">Folder:</span> <code id="s4-folder"></code></div>
+                        <div class="hint" data-i18n="step4.contains">Contains raw EEG, filtered EEG, VR events, annotations and θ/α metrics, synchronized.</div>
+                    </div>
+                    <a class="btn ghost" id="s4-download" href="#" data-i18n="common.download">Download</a>
+                </div>
+                <button class="btn link" id="s4-export-raw" data-i18n="step4.export_raw">Also save an EEG-only file</button>
+            </div>
+            <div id="s4-fail" hidden>
+                <div class="result-head fail"><span class="result-icon">!</span><h2 data-i18n="step4.failed">The trial could not be saved</h2></div>
+                <p id="s4-error" class="error-text"></p>
+                <p class="hint" data-i18n="step4.failed_hint">The data is still in memory. Try again before recording another trial.</p>
+                <button class="btn" id="s4-retry" data-i18n="step4.retry">Try saving again</button>
+            </div>
+
+            <div class="field">
+                <label for="s4-notes" data-i18n="step4.notes">Notes about this trial (optional)</label>
+                <textarea id="s4-notes" class="input" rows="2" data-i18n-placeholder="step4.notes_ph" placeholder="e.g. participant moved at 01:20"></textarea>
+            </div>
+
+            <div class="actions">
+                <button class="btn ghost" id="s4-new-subject" data-i18n="step4.new_participant">New participant</button>
+                <button class="btn primary" id="s4-next-trial" data-i18n="step4.next_trial">Record next trial →</button>
+            </div>
+        </div>
+    </section>
+
+    <!-- =============================== PARTICIPANTS =============================== -->
+    <section id="view-participants" class="view">
+        <div class="view-head">
+            <div>
+                <h2 data-i18n="nav.participants">Participants</h2>
+                <p class="lead" data-i18n="part.lead">Everyone registered for experiments. Click a row to edit it.</p>
+            </div>
+            <div class="view-tools">
+                <input id="p-search" class="input" type="search" data-i18n-placeholder="common.search" placeholder="Search…">
+                <button class="btn primary" id="p-add" data-i18n="part.add">+ New participant</button>
+            </div>
+        </div>
+        <div class="card table-card">
+            <table class="table">
+                <thead><tr>
+                    <th data-i18n="subj.name">Name or code</th>
+                    <th data-i18n="subj.age">Age</th>
+                    <th data-i18n="subj.gender">Gender</th>
+                    <th data-i18n="part.trials">Trials</th>
+                    <th data-i18n="part.last">Last recording</th>
+                    <th data-i18n="subj.notes">Notes</th>
+                    <th></th>
+                </tr></thead>
+                <tbody id="p-table"></tbody>
+            </table>
+            <div id="p-empty" class="empty-state" hidden data-i18n="part.empty">No participants yet.</div>
+        </div>
+    </section>
+
+    <!-- =============================== HISTORY =============================== -->
+    <section id="view-history" class="view">
+        <div class="view-head">
+            <div>
+                <h2 data-i18n="nav.history">History</h2>
+                <p class="lead" data-i18n="hist.lead">All recorded trials and their files.</p>
+            </div>
+            <div class="view-tools">
+                <select id="h-subject" class="input"></select>
+            </div>
+        </div>
+        <div class="card table-card">
+            <table class="table">
+                <thead><tr>
+                    <th data-i18n="hist.date">Date</th>
+                    <th data-i18n="step1.select">Participant</th>
+                    <th data-i18n="rec.trial">Trial</th>
+                    <th data-i18n="step4.duration">Duration</th>
+                    <th data-i18n="rec.markers">events</th>
+                    <th data-i18n="filters.title">Real-time filters</th>
+                    <th data-i18n="hist.files">Files</th>
+                    <th data-i18n="subj.notes">Notes</th>
+                </tr></thead>
+                <tbody id="h-table"></tbody>
+            </table>
+            <div id="h-empty" class="empty-state" hidden data-i18n="hist.empty">No trials recorded yet.</div>
+        </div>
+    </section>
+</main>
+
+<!-- Participant editor -->
+<div class="modal-overlay" id="subject-modal" hidden>
+    <form class="modal" id="subject-form" autocomplete="off">
+        <h3 id="subject-modal-title" data-i18n="part.edit">Edit participant</h3>
+        <div class="form-grid">
+            <div class="field span-2">
+                <label for="m-name"><span data-i18n="subj.name">Name or code</span> *</label>
+                <input id="m-name" class="input" required>
+            </div>
+            <div class="field">
+                <label for="m-age" data-i18n="subj.age">Age</label>
+                <input id="m-age" class="input" type="number" min="0" max="130">
+            </div>
+            <div class="field">
+                <label for="m-gender" data-i18n="subj.gender">Gender</label>
+                <select id="m-gender" class="input">
+                    <option value="" data-i18n="subj.gender_none">—</option>
+                    <option value="Male" data-i18n="subj.male">Male</option>
+                    <option value="Female" data-i18n="subj.female">Female</option>
+                    <option value="Other" data-i18n="subj.other">Other</option>
+                </select>
+            </div>
+            <div class="field span-2">
+                <label for="m-notes" data-i18n="subj.notes">Notes</label>
+                <textarea id="m-notes" class="input" rows="3"></textarea>
+            </div>
+        </div>
+        <div class="modal-actions">
+            <button type="button" class="btn ghost" id="m-cancel" data-i18n="common.cancel">Cancel</button>
+            <button type="submit" class="btn primary" data-i18n="common.save">Save</button>
+        </div>
+    </form>
+</div>
+
+<!-- Channel names -->
+<div class="modal-overlay" id="montage-modal" hidden>
+    <form class="modal wide" id="montage-form" autocomplete="off">
+        <h3 data-i18n="montage.title">Channel names</h3>
+        <p class="hint" data-i18n="montage.hint">Name each channel after its electrode position (10-20 system). The names are shown in the plot and saved in the XDF file. They are remembered for this device.</p>
+        <div class="montage-presets">
+            <button type="button" class="btn small" id="montage-preset-1020">Fz Cz Pz C3 C4 P3 P4 Oz</button>
+            <button type="button" class="btn small" id="montage-preset-device" data-i18n="montage.device">Device names</button>
+        </div>
+        <div class="montage-grid" id="montage-grid"></div>
+        <div class="modal-actions">
+            <button type="button" class="btn ghost" id="montage-cancel" data-i18n="common.cancel">Cancel</button>
+            <button type="submit" class="btn primary" data-i18n="common.save">Save</button>
+        </div>
+    </form>
+</div>
+
+<!-- Help -->
+<div class="modal-overlay" id="help-modal" hidden>
+    <div class="modal wide">
+        <h3 data-i18n="help.title">How a session works</h3>
+        <ol class="help-steps">
+            <li><strong data-i18n="step1.title">Participant</strong> — <span data-i18n="help.s1">pick or register who is taking part.</span></li>
+            <li><strong data-i18n="step2.title">Connect streams</strong> — <span data-i18n="help.s2">start the AURA software and the VR game; wait until EEG (and VR) turn green.</span></li>
+            <li><strong data-i18n="step3.title">Signal &amp; record</strong> — <span data-i18n="help.s3">look at the live signal, choose filters, then Start. Press Stop when the task ends.</span></li>
+            <li><strong data-i18n="step4.title">Saved</strong> — <span data-i18n="help.s4">the trial is saved automatically as an .xdf file. Add notes and record the next trial.</span></li>
+        </ol>
+        <h4 data-i18n="help.lights">Status lights (top right)</h4>
+        <ul class="help-list">
+            <li><span class="dot-demo ok"></span> <span data-i18n="help.green">receiving data</span></li>
+            <li><span class="dot-demo warn"></span> <span data-i18n="help.amber">found but not connected yet / checking</span></li>
+            <li><span class="dot-demo off"></span> <span data-i18n="help.grey">not found</span></li>
+        </ul>
+        <h4 data-i18n="help.files">Where are the files?</h4>
+        <p data-i18n="help.files_text">In the data/ folder of the app (shown after each trial) and in History, where you can download them.</p>
+        <div class="modal-actions">
+            <button class="btn primary" id="help-close" data-i18n="common.got_it">Got it</button>
+        </div>
+    </div>
+</div>
+
+<!-- Generic confirm -->
+<div class="modal-overlay" id="confirm-modal" hidden>
+    <div class="modal">
+        <h3 id="confirm-title"></h3>
+        <p id="confirm-text"></p>
+        <div class="modal-actions">
+            <button class="btn ghost" id="confirm-no" data-i18n="common.cancel">Cancel</button>
+            <button class="btn primary" id="confirm-yes" data-i18n="common.continue">Continue</button>
+        </div>
+    </div>
+</div>
+
+<div id="toast" class="toast" hidden></div>
+
+<script src="/static/js/i18n.js"></script>
+<script src="/static/js/operator-i18n.js"></script>
+<script src="/static/js/app.js"></script>
 </body>
 </html>

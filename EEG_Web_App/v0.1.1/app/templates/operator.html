@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VR EEG Studio · Operator</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/css/operator.css">
+    <script src="/static/js/vendor/plotly-2.27.0.min.js"></script>
+</head>
+<body class="op">
+
+<header class="op-header" id="op-header">
+    <div class="wrap header-row">
+        <a class="logo" href="/" id="logo" aria-label="VR EEG Studio home">
+            <svg width="30" height="30" viewBox="0 0 30 30" aria-hidden="true"><rect x="1" y="1" width="28" height="28" rx="8" fill="#0B5E6B"></rect><path d="M6 16h4l2-5 3 9 3-11 2 7h4" fill="none" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path></svg>
+            <strong>VR EEG Studio</strong>
+        </a>
+        <nav class="op-nav" aria-label="Main">
+            <button class="nav-link active" data-view="home">Home</button>
+            <button class="nav-link" data-view="participants">Participants</button>
+            <button class="nav-link" data-view="experiments">Experiments</button>
+            <button class="nav-link" data-view="reports">Reports</button>
+        </nav>
+        <div class="header-right">
+            <span class="dev-pill" id="pill-eeg"><span class="dot"></span><span class="txt">EEG headset</span></span>
+            <span class="dev-pill" id="pill-vr"><span class="dot"></span><span class="txt">VR game</span></span>
+            <div class="mode-switch" role="group" aria-label="Mode">
+                <span class="mode-on">Operator</span>
+                <a href="/researcher" id="to-researcher">Researcher</a>
+            </div>
+        </div>
+    </div>
+</header>
+
+<!-- red recording strip -->
+<div class="rec-strip" id="rec-strip" hidden>
+    <div class="wrap rec-row">
+        <span class="rec-title"><span class="rec-dot"></span><span id="rec-title">Recording</span></span>
+        <span id="rec-context"></span>
+        <span class="rec-saving"><svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 8.5l3 3 7-7" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"></path></svg><span id="rec-saving">Saving to disk</span></span>
+    </div>
+</div>
+
+<main class="wrap op-main">
+
+    <!-- ================================ HOME ================================ -->
+    <section class="view active" id="view-home">
+        <div class="banner danger clickable" id="home-recording" hidden></div>
+        <div class="banner warn" id="home-recovered" hidden></div>
+        <div class="row">
+            <div class="hero">
+                <span class="hero-date" id="home-date"></span>
+                <h1 id="home-greeting">Good morning.<br>Shall we start a session?</h1>
+                <p>Choose the participant and the experiment; the app checks the headset and the signal and guides you step by step.</p>
+                <div class="hero-actions">
+                    <button class="btn light xl" id="home-new"><svg width="20" height="20" viewBox="0 0 20 20" aria-hidden="true"><path d="M10 4v12M4 10h12" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"></path></svg>New session</button>
+                    <button class="btn outline-dark xl continue" id="home-continue" hidden></button>
+                </div>
+            </div>
+            <div class="card checks">
+                <h2>Before you start</h2>
+                <div class="check-row"><span class="check-icon" id="chk-eeg-icon"></span><div><strong id="chk-eeg-title">EEG headset</strong><span id="chk-eeg-text">Checking…</span></div></div>
+                <div class="check-row"><span class="check-icon" id="chk-vr-icon"></span><div><strong id="chk-vr-title">VR game</strong><span id="chk-vr-text">Checking…</span></div></div>
+                <div class="check-row"><span class="check-icon" id="chk-disk-icon"></span><div><strong>Disk space</strong><span id="chk-disk-text">—</span></div></div>
+            </div>
+        </div>
+
+        <div class="kpis four" aria-label="Summary">
+            <div class="kpi"><span class="kpi-label">Sessions today</span><span class="kpi-val" id="k-today">0</span><span class="kpi-sub" id="k-today-sub"></span></div>
+            <div class="kpi"><span class="kpi-label">This week</span><span class="kpi-val" id="k-week">0</span><span class="kpi-sub">sessions started</span></div>
+            <div class="kpi"><span class="kpi-label">Usable data</span><span class="kpi-val good" id="k-usable">—</span><span class="kpi-sub">time with good signal</span></div>
+            <div class="kpi"><span class="kpi-label">EEG recorded</span><span class="kpi-val" id="k-hours">0</span><span class="kpi-sub" id="k-hours-sub"></span></div>
+        </div>
+
+        <div class="row">
+            <div class="card grow table-card">
+                <div class="card-head"><h2>Recent sessions</h2><button class="link" data-goto="reports">See reports</button></div>
+                <div class="table-scroll">
+                    <table class="tbl">
+                        <thead><tr><th>Participant</th><th>Experiment</th><th>Progress</th><th>Signal</th><th>Status</th></tr></thead>
+                        <tbody id="home-recent"></tbody>
+                    </table>
+                </div>
+                <div class="empty" id="home-recent-empty" hidden>No sessions yet. Press “New session” to begin.</div>
+            </div>
+            <div class="side-col">
+                <h2 class="col-title">Experiments</h2>
+                <div id="home-experiments" class="exp-list"></div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ================================ PARTICIPANTS ================================ -->
+    <section class="view" id="view-participants">
+        <div class="view-head">
+            <div><h1>Participants</h1><p class="muted">Select a participant to see their sessions.</p></div>
+            <div class="tools">
+                <input id="p-search" class="input" type="search" placeholder="Search…" aria-label="Search participants">
+                <button class="btn primary" id="p-add">+ New participant</button>
+            </div>
+        </div>
+        <div class="row">
+            <div class="card grow table-card">
+                <div class="table-scroll">
+                    <table class="tbl">
+                        <thead><tr><th>Name or code</th><th>Age</th><th>Sessions</th><th>Last recording</th></tr></thead>
+                        <tbody id="p-table"></tbody>
+                    </table>
+                </div>
+                <div class="empty" id="p-empty" hidden>No participants yet.</div>
+            </div>
+            <div class="card side-col" id="p-detail"><div class="empty">Select a participant.</div></div>
+        </div>
+    </section>
+
+    <!-- ================================ EXPERIMENTS ================================ -->
+    <section class="view" id="view-experiments">
+        <div class="view-head">
+            <div><h1>Experiments</h1><p class="muted">Each experiment defines the baseline, the trials, the rests, the checklist and the channels used. Filters are applied automatically.</p></div>
+            <div class="tools"><button class="btn primary" id="exp-add">+ New experiment</button></div>
+        </div>
+        <div class="exp-grid" id="exp-grid"></div>
+    </section>
+
+    <!-- ================================ REPORTS (lab statistics) ================================ -->
+    <section class="view" id="view-reports">
+        <div class="view-head">
+            <div><h1>Study progress</h1><p class="muted" id="st-sub"></p></div>
+            <div class="tools">
+                <label class="inline-label">Experiment <select id="st-exp" class="input"></select></label>
+                <label class="inline-label">Period <select id="st-weeks" class="input"><option value="8">Last 8 weeks</option><option value="26">Last 6 months</option><option value="52">Last year</option></select></label>
+                <a class="btn" id="st-export" href="#">Export dataset (CSV)</a>
+            </div>
+        </div>
+        <div class="kpis four">
+            <div class="kpi"><span class="kpi-label">Recruitment</span><span class="kpi-val" id="st-recruit">—</span><div class="bar"><span id="st-recruit-bar"></span></div></div>
+            <div class="kpi"><span class="kpi-label">Completed sessions</span><span class="kpi-val" id="st-complete">—</span><span class="kpi-sub" id="st-complete-sub"></span></div>
+            <div class="kpi"><span class="kpi-label">Usable data</span><span class="kpi-val good" id="st-usable">—</span><span class="kpi-sub">time with good signal</span></div>
+            <div class="kpi"><span class="kpi-label">Median preparation</span><span class="kpi-val" id="st-prep">—</span><span class="kpi-sub">from opening the session to the first step</span></div>
+        </div>
+        <div class="row">
+            <div class="card grow">
+                <h2>Sessions per week</h2>
+                <div class="week-chart" id="st-weeks-chart" role="img" aria-label="Sessions per week"></div>
+                <div class="week-labels" id="st-weeks-labels"></div>
+            </div>
+            <div class="card grow">
+                <div class="card-head"><h2>Mean signal quality per electrode</h2><span class="muted small">% of time “good”</span></div>
+                <div id="st-channels" class="ch-bars"></div>
+                <div class="callout warn" id="st-channels-note" hidden></div>
+            </div>
+        </div>
+        <div class="row">
+            <div class="card grow">
+                <div class="card-head"><h2 id="st-dist-title">Frontal θ/α per step, all participants</h2><span class="muted small">each dot = 1 participant · bar = median</span></div>
+                <div class="dot-plot" id="st-dist" role="img" aria-label="Distribution of the frontal theta/alpha ratio per step"></div>
+            </div>
+            <div class="dark-card side-col">
+                <h2>Quick read</h2>
+                <ul id="st-quick"></ul>
+                <p class="dim small">Automatic descriptive summary; statistical inference is done outside the app.</p>
+            </div>
+        </div>
+    </section>
+
+    <!-- ================================ SESSION ================================ -->
+    <section class="view" id="view-session">
+        <div class="session-strip card">
+            <div class="facts">
+                <div><span>Participant</span><strong id="s-participant">—</strong></div>
+                <div><span>Experiment</span><strong id="s-experiment">—</strong></div>
+                <div><span>Operator</span><strong id="s-operator">—</strong></div>
+            </div>
+            <button class="btn" id="s-leave">Leave session</button>
+        </div>
+        <ol class="stepper" id="s-stepper" aria-label="Session steps">
+            <li data-phase="participant"><span class="num">1</span>Participant</li>
+            <li data-phase="prepare"><span class="num">2</span>Prepare</li>
+            <li data-phase="record"><span class="num">3</span>Record</li>
+            <li data-phase="report"><span class="num">4</span>Report</li>
+        </ol>
+
+        <!-- ---------- prepare ---------- -->
+        <div class="phase" id="phase-prepare">
+            <div class="row stretch">
+                <section class="card grow">
+                    <div class="card-head"><h1 class="h-md">Electrode quality</h1><span class="q-count" id="p-good-count"></span></div>
+                    <div class="headmap-row">
+                        <figure class="headmap" id="p-headmap"></figure>
+                        <div class="headmap-side">
+                            <div class="guide" id="p-guide"></div>
+                            <div class="legend">
+                                <span class="lg good"><span></span>Good</span>
+                                <span class="lg warn"><span></span>Check</span>
+                                <span class="lg bad"><span></span>Fix</span>
+                                <span class="lg flat"><span></span>No signal</span>
+                            </div>
+                            <p class="muted small" id="p-channels-note"></p>
+                            <details class="signal" id="p-signal"><summary>Show the live signal</summary><div class="plot" id="p-plot"></div></details>
+                        </div>
+                    </div>
+                </section>
+                <aside class="side-col">
+                    <section class="card">
+                        <div class="card-head"><h2>Checklist</h2><span class="mono muted" id="p-check-count"></span></div>
+                        <div id="p-checklist" class="checklist"></div>
+                    </section>
+                    <section class="card">
+                        <h2>Devices</h2>
+                        <div class="dev-row"><span class="dot-lg" id="p-eeg-dot"></span><div><strong>EEG headset</strong><span id="p-eeg-text">Connecting…</span></div></div>
+                        <div class="dev-row"><span class="dot-lg" id="p-vr-dot"></span><div><strong>VR game</strong><span id="p-vr-text">Connecting…</span></div></div>
+                        <button class="btn small" id="p-reconnect">Connect again</button>
+                        <p class="muted small sep" id="p-filters"></p>
+                    </section>
+                </aside>
+            </div>
+            <div class="action-bar">
+                <div><strong id="p-ready-title">Getting ready</strong><span id="p-ready-text"></span></div>
+                <button class="btn primary xl" id="p-begin" disabled>Start →</button>
+            </div>
+        </div>
+
+        <!-- ---------- record ---------- -->
+        <div class="phase" id="phase-record" hidden>
+            <ol class="timeline" id="r-timeline" aria-label="Experiment steps"></ol>
+            <div class="row">
+                <section class="card grow run-card">
+                    <span class="run-kicker" id="r-kicker">Next</span>
+                    <h1 class="run-title" id="r-title">—</h1>
+                    <div class="timer" id="r-timer">00:00</div>
+                    <div class="progress"><span id="r-progress"></span></div>
+                    <span class="muted" id="r-timer-sub"></span>
+                    <div class="rest" id="r-rest" hidden></div>
+                    <div class="instruction">
+                        <svg width="26" height="26" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9v6h4l5 4V5L8 9H4z M16 9a4 4 0 0 1 0 6 M18.5 6.5a8 8 0 0 1 0 11" fill="none" stroke="#0B5E6B" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path></svg>
+                        <div><strong>Instruction for the participant</strong><span id="r-instruction"></span></div>
+                    </div>
+                    <div class="run-actions">
+                        <button class="btn xl" id="r-main"></button>
+                        <button class="btn" id="r-repeat" hidden></button>
+                    </div>
+                    <div class="saved-line" id="r-saved" hidden></div>
+                </section>
+                <aside class="side-col">
+                    <section class="card">
+                        <div class="card-head"><h2>Signal</h2><span class="q-count" id="r-good-count"></span></div>
+                        <div class="q-grid" id="r-quality"></div>
+                    </section>
+                    <section class="card">
+                        <h2>Something happened? Mark it</h2>
+                        <div class="note-grid">
+                            <button class="note-btn" data-note="Movement">Movement<kbd>1</kbd></button>
+                            <button class="note-btn" data-note="Blinks">Blinks<kbd>2</kbd></button>
+                            <button class="note-btn" data-note="Talking">Talking<kbd>3</kbd></button>
+                            <button class="note-btn" data-note="Discomfort">Discomfort<kbd>4</kbd></button>
+                        </div>
+                        <form id="note-form" autocomplete="off">
+                            <label class="field"><span>Free note (key N)</span><input class="input" id="note-input" maxlength="200" placeholder="Type and press Enter"></label>
+                        </form>
+                        <ul class="events" id="r-events"><li class="muted">No events yet</li></ul>
+                    </section>
+                    <details class="card signal"><summary>Show the live signal</summary><div class="plot" id="r-plot"></div></details>
+                    <p class="muted small pad" id="r-next-note"></p>
+                    <button class="link danger small pad" id="r-abort">Cancel session</button>
+                </aside>
+            </div>
+        </div>
+
+        <!-- ---------- report ---------- -->
+        <div class="phase" id="phase-report" hidden>
+            <div class="report-head">
+                <div class="report-title">
+                    <span class="pill" id="rep-status"></span>
+                    <h1 id="rep-title">—</h1>
+                    <span class="muted" id="rep-meta"></span>
+                </div>
+                <div class="tools">
+                    <button class="btn" id="rep-print">Print / PDF</button>
+                    <a class="btn" id="rep-csv" href="#">Metrics CSV</a>
+                    <a class="btn primary" id="rep-zip" href="#">XDF files</a>
+                </div>
+            </div>
+            <div class="kpis five" id="rep-kpis"></div>
+            <div class="row stretch">
+                <section class="card grow">
+                    <div class="card-head wrap-gap"><h2>Cognitive-load index (θ/α) per step</h2><div class="legend" id="rep-ta-legend"></div></div>
+                    <div class="ta-chart" id="rep-ta" role="img"></div>
+                    <div class="ta-labels" id="rep-ta-labels"></div>
+                    <p class="muted small" id="rep-ta-note"></p>
+                </section>
+                <div class="side-col">
+                    <div class="dark-card">
+                        <h2>In plain words</h2>
+                        <p id="rep-plain"></p>
+                        <p class="dim small">Exploratory research indicator; not a diagnosis.</p>
+                    </div>
+                    <section class="card">
+                        <h2>Data quality notes</h2>
+                        <ul class="warn-list" id="rep-warnings"></ul>
+                    </section>
+                </div>
+            </div>
+            <section class="card">
+                <div class="card-head"><h2>Signal quality per electrode over the session</h2><span class="muted small">each cell = 30 s</span></div>
+                <div class="table-scroll"><div class="heat" id="rep-heat" role="img" aria-label="Signal quality map per electrode and time"></div></div>
+                <div class="legend">
+                    <span class="lg good"><span></span>Good</span>
+                    <span class="lg warn"><span></span>Check</span>
+                    <span class="lg bad"><span></span>Fix</span>
+                    <span class="lg rest"><span></span>Rest (not recorded)</span>
+                </div>
+            </section>
+            <section class="card table-card">
+                <div class="card-head"><h2>Step details</h2></div>
+                <div class="table-scroll">
+                    <table class="tbl" id="rep-table"></table>
+                </div>
+            </section>
+            <section class="card finish-row">
+                <label class="field grow"><span>Session notes</span><textarea class="input" id="rep-notes" rows="2"></textarea></label>
+                <div class="tools">
+                    <button class="btn" id="rep-repeat">Record another step</button>
+                    <button class="btn primary xl" id="rep-finish">Finish session</button>
+                </div>
+            </section>
+        </div>
+    </section>
+</main>
+
+<!-- New session -->
+<div class="overlay" id="ns-modal" hidden>
+    <form class="modal wide" id="ns-form" autocomplete="off">
+        <h2>New session</h2>
+        <label class="field"><span>Participant</span>
+            <div class="inline-row">
+                <select id="ns-participant" class="input"></select>
+                <button type="button" class="btn small" id="ns-add">+ New</button>
+            </div>
+        </label>
+        <div class="inline-new" id="ns-new" hidden>
+            <label class="field"><span>Name or code *</span><input class="input" id="ns-name" placeholder="e.g. P-015"></label>
+            <label class="field"><span>Age</span><input class="input" id="ns-age" type="number" min="0" max="130"></label>
+        </div>
+        <div class="field"><span>Experiment</span><div class="exp-choice" id="ns-experiments"></div></div>
+        <label class="field"><span>Your name (operator)</span><input class="input" id="ns-operator"></label>
+        <div class="modal-actions">
+            <button type="button" class="btn" id="ns-cancel">Cancel</button>
+            <button type="submit" class="btn primary">Continue</button>
+        </div>
+    </form>
+</div>
+
+<!-- Experiment editor -->
+<div class="overlay" id="exp-modal" hidden>
+    <form class="modal wide" id="exp-form" autocomplete="off">
+        <h2 id="exp-title">New experiment</h2>
+        <label class="field"><span>Name *</span><input class="input" id="e-name" required></label>
+        <label class="field"><span>Description</span><input class="input" id="e-desc"></label>
+        <div class="grid3">
+            <label class="field"><span>Resting baseline</span>
+                <select class="input" id="e-baseline"><option value="0">None</option><option value="30">30 s</option><option value="60">1 min</option><option value="120">2 min</option><option value="180">3 min</option><option value="300">5 min</option></select></label>
+            <label class="field"><span>Baseline type</span>
+                <select class="input" id="e-btype"><option value="eyes_open">Eyes open</option><option value="eyes_closed">Eyes closed</option></select></label>
+            <label class="field"><span>Number of trials</span><input class="input" id="e-trials" type="number" min="1" max="100"></label>
+            <label class="field"><span>Trial length (min)</span><input class="input" id="e-duration" type="number" min="0" step="any"><small>0 = stop manually</small></label>
+            <label class="field"><span>Rest between trials (s)</span><input class="input" id="e-rest" type="number" min="0"></label>
+            <label class="field"><span>Target participants</span><input class="input" id="e-target" type="number" min="1"></label>
+        </div>
+        <label class="field"><span>Instruction read to the participant before each trial</span><textarea class="input" id="e-instr" rows="2"></textarea></label>
+        <label class="field"><span>Checklist</span><textarea class="input" id="e-check" rows="4"></textarea><small>One item per line.</small></label>
+        <details class="advanced">
+            <summary>Advanced settings (channels, streams, filters)</summary>
+            <div class="grid3">
+                <label class="field"><span>Channels analysed</span><input class="input" id="e-nch" type="number" min="1" max="64"><small>first N channels of the EEG stream</small></label>
+                <label class="field span2"><span>Names of those channels</span><input class="input" id="e-labels"><small>comma separated, in stream order</small></label>
+                <label class="field"><span>EEG stream (name)</span><input class="input" id="e-eeg"></label>
+                <label class="field span2"><span>VR marker stream (name)</span><input class="input" id="e-vr"></label>
+            </div>
+            <div class="filter-row">
+                <label><input type="checkbox" id="ef-notch"> Notch</label>
+                <select class="input tiny" id="ef-notch-freq"><option value="60">60 Hz</option><option value="50">50 Hz</option></select>
+                <label><input type="checkbox" id="ef-bp"> Band-pass</label>
+                <input class="input tiny" id="ef-lo" type="number" step="0.1"> – <input class="input tiny" id="ef-hi" type="number"> Hz
+                <label><input type="checkbox" id="ef-bl"> Baseline correction</label>
+                <label><input type="checkbox" id="ef-asr"> Artifact clipping</label>
+                <label><input type="checkbox" id="ef-wvlt"> Wavelet</label>
+            </div>
+        </details>
+        <div class="modal-actions">
+            <button type="button" class="btn link danger" id="e-archive" hidden>Archive</button>
+            <span class="spacer"></span>
+            <button type="button" class="btn" id="e-cancel">Cancel</button>
+            <button type="submit" class="btn primary">Save</button>
+        </div>
+    </form>
+</div>
+
+<!-- Participant editor -->
+<div class="overlay" id="subj-modal" hidden>
+    <form class="modal" id="subj-form" autocomplete="off">
+        <h2 id="subj-title">New participant</h2>
+        <label class="field"><span>Name or code *</span><input class="input" id="m-name" required></label>
+        <div class="grid2">
+            <label class="field"><span>Age</span><input class="input" id="m-age" type="number" min="0" max="130"></label>
+            <label class="field"><span>Gender</span><select class="input" id="m-gender"><option value="">—</option><option>Male</option><option>Female</option><option>Other</option></select></label>
+        </div>
+        <label class="field"><span>Notes</span><textarea class="input" id="m-notes" rows="3"></textarea></label>
+        <div class="modal-actions">
+            <button type="button" class="btn" id="m-cancel">Cancel</button>
+            <button type="submit" class="btn primary">Save</button>
+        </div>
+    </form>
+</div>
+
+<!-- Confirm -->
+<div class="overlay" id="confirm-modal" hidden>
+    <div class="modal">
+        <h2 id="confirm-title"></h2>
+        <p id="confirm-text"></p>
+        <div class="modal-actions">
+            <button class="btn" id="confirm-no">Cancel</button>
+            <button class="btn primary" id="confirm-yes">Continue</button>
+        </div>
+    </div>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+<script src="/static/js/operator.js"></script>
+</body>
+</html>

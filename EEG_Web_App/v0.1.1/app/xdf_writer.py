@@ -97,7 +97,8 @@ def write_xdf(path, streams):
                         body += data[i].tobytes()
                 f.write(_chunk(3, bytes(body)))
 
-            f.write(_chunk(4, struct.pack("<Idd", sid, last_ts, 0.0)))
+            # two offsets at distinct times so readers can fit a (zero) clock drift
+            f.write(_chunk(4, struct.pack("<Idd", sid, max(last_ts, first_ts + 1.0), 0.0)))
 
             footer = (
                 '<?xml version="1.0"?><info>'

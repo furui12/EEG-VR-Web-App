@@ -5,3 +5,6 @@ venv/
 .DS_Store
 # Local database and recordings (contain participant data)
 EEG_Web_App/*/data/
+
+# Local Claude Code config
+.claude/
